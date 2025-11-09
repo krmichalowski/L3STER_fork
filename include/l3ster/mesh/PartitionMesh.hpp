@@ -207,26 +207,41 @@ auto uncondenseNodes(const util::ArrayOwner< idx_t >&  epart,
 void distributeMetisInput(const MpiComm& comm, detail::MetisInput& input)
 {
     int rank = comm.getRank();
+    int comm_size = comm.getSize();
+    auto& [e_ind, e_ptr] = input; 
     if(rank == 0)
     {
         //e_ind, e_ptr, indexy, poczatki kolejnych elementow w tablicy
         std::vector<int> info(2);
-        info[0] = input.e_ptr.size() - 1; //n elems
-        info[1] = info[0]/comm.getSize(); //n elems per rank
+        info[0] = e_ptr.size() - 1; //n elems
+        info[1] = info[0]/comm_size; //n elems per rank
         comm.broadcast(info, 0);
+
+        std::vector<std::vector<int>> buffers(comm_size - 1);
+        std::vector<MpiComm::Request> reqs(comm_size - 1);
+        for(int i=1;i<comm_size;i++)
+        {
+            buffers[i - 1].resize(2);
+            buffers[i - 1][0] = e_ptr[i * info[1]]; //offset
+            buffers[i - 1][1] = e_ptr[i * info[1]] - e_ptr[(i - 1) * info[1]]; //n indexes
+            reqs[i - 1] = comm.sendAsync(buffers[i - 1], i, 0);
+        }
+        MpiComm::Request::waitAll(reqs);
     }
     else
     {
         std::vector<int> info(2);
         comm.broadcast(info, 0);
 
-        if(rank == comm.getSize() - 1)
+        if(rank == comm_size - 1)
         {
-            int rest = info[0] - info[1] * comm.getSize();
+            int rest = info[0] - info[1] * comm_size;
             info[1] += rest;
         }
+        e_ptr.resize(info[1] + 1);
 
-        input.e_ptr.resize(info[1] + 1);
+        std::vector<int> buffer(2);
+        comm.receive(buffer, 0, 0);
     }
 }
 
