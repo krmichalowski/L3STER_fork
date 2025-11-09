@@ -212,36 +212,69 @@ void distributeMetisInput(const MpiComm& comm, detail::MetisInput& input)
     if(rank == 0)
     {
         //e_ind, e_ptr, indexy, poczatki kolejnych elementow w tablicy
-        std::vector<int> info(2);
+        std::vector<idx_t> info(2);
         info[0] = e_ptr.size() - 1; //n elems
         info[1] = info[0]/comm_size; //n elems per rank
         comm.broadcast(info, 0);
 
-        std::vector<std::vector<int>> buffers(comm_size - 1);
+        std::vector<std::vector<idx_t>> n_indexes(comm_size - 1);
         std::vector<MpiComm::Request> reqs(comm_size - 1);
+        for(int i=1;i<comm_size - 1;i++)
+        {
+            n_indexes[i - 1].resize(1);
+            n_indexes[i - 1][0] = e_ptr[(i + 1) * info[1]] - e_ptr[i * info[1]];
+            reqs[i - 1] = comm.sendAsync(n_indexes[i - 1], i, 0);
+        }
+        n_indexes[comm_size - 2].resize(1);
+        n_indexes[comm_size - 2][0] = e_ptr[e_ptr.size() - 1] - e_ptr[(comm_size - 1) * info[1]];
+        reqs[comm_size - 2] = comm.sendAsync(n_indexes[comm_size - 2], comm_size - 1, 0);
+        MpiComm::Request::waitAll(reqs);
+
+        std::vector<std::vector<idx_t>> reduced_indexes(comm_size - 1);
+        std::vector<std::vector<idx_t>> reduced_ptr(comm_size - 1);
+        
+        idx_t offset = e_ptr[info[1]] - e_ptr[0];
         for(int i=1;i<comm_size;i++)
         {
-            buffers[i - 1].resize(2);
-            buffers[i - 1][0] = e_ptr[i * info[1]]; //offset
-            buffers[i - 1][1] = e_ptr[i * info[1]] - e_ptr[(i - 1) * info[1]]; //n indexes
-            reqs[i - 1] = comm.sendAsync(buffers[i - 1], i, 0);
+            reduced_indexes[i - 1].resize(n_indexes[i - 1][0]);
+            std::memcpy(reduced_indexes[i - 1].data(), e_ind.data() + offset, sizeof(idx_t) * n_indexes[i - 1][0]);
+            offset += n_indexes[i - 1][0];
+            reqs[i - 1] = comm.sendAsync(reduced_indexes[i - 1], i, 1);
         }
+        MpiComm::Request::waitAll(reqs);
+
+        offset = info[1];
+        for(int i=1;i<comm_size - 1;i++)
+        {
+            reduced_ptr[i - 1].resize(info[1] + 1);
+            std::memcpy(reduced_ptr[i - 1].data(), e_ptr.data() + offset, sizeof(idx_t) * info[1]);
+            reduced_ptr[i - 1][info[1]] = reduced_indexes[i][0];
+            offset += info[1];
+            reqs[i - 1] = comm.sendAsync(reduced_ptr[i - 1], i, 2);
+        }
+        reduced_ptr[comm_size - 2].resize(info[0] - (comm_size - 1) * info[1] + 1);
+        std::memcpy(reduced_ptr[comm_size - 2].data(), e_ptr.data() + offset, sizeof(idx_t) * (info[0] - (comm_size - 1) * info[1]));
+        reduced_ptr[comm_size - 2][info[0] - (comm_size - 1) * info[1]] = e_ind.size();
+        reqs[comm_size - 2] = comm.sendAsync(reduced_ptr[comm_size - 2], comm_size - 1, 2);
         MpiComm::Request::waitAll(reqs);
     }
     else
     {
-        std::vector<int> info(2);
+        std::vector<idx_t> info(2);
         comm.broadcast(info, 0);
 
         if(rank == comm_size - 1)
         {
-            int rest = info[0] - info[1] * comm_size;
+            idx_t rest = info[0] - info[1] * comm_size;
             info[1] += rest;
         }
         e_ptr.resize(info[1] + 1);
-
-        std::vector<int> buffer(2);
-        comm.receive(buffer, 0, 0);
+        
+        std::vector<idx_t> n_indexes(1);
+        comm.receive(n_indexes, 0, 0);
+        e_ind.resize(n_indexes[0]);
+        comm.receive(e_ind, 0, 1);
+        comm.receive(e_ptr, 0, 2);
     }
 }
 
