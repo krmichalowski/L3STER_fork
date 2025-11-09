@@ -204,22 +204,50 @@ auto uncondenseNodes(const util::ArrayOwner< idx_t >&  epart,
     return retval;
 }
 
+void distributeMetisInput(const MpiComm& comm, detail::MetisInput& input)
+{
+    int rank = comm.getRank();
+    if(rank == 0)
+    {
+        //e_ind, e_ptr, indexy, poczatki kolejnych elementow w tablicy
+        std::vector<int> info(2);
+        info[0] = input.e_ptr.size() - 1; //n elems
+        info[1] = info[0]/comm.getSize(); //n elems per rank
+        comm.broadcast(info, 0);
+    }
+    else
+    {
+        std::vector<int> info(2);
+        comm.broadcast(info, 0);
+
+        if(rank == comm.getSize() - 1)
+        {
+            int rest = info[0] - info[1] * comm.getSize();
+            info[1] += rest;
+        }
+
+        input.e_ptr.resize(info[1] + 1);
+    }
+}
+
 template < el_o_t... orders >
 auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
                             const util::ArrayOwner< d_id_t >& domain_ids,
                             DomainData                        domain_data,
-                            idx_t                             n_parts,
+                            const MpiComm&                    comm,
                             util::ArrayOwner< real_t >        part_weights,
                             util::ArrayOwner< idx_t >         node_weights) -> MetisOutput
 {
     const auto [forward_map, reverse_map] = makeNodeCondensationMaps(mesh);
     node_weights                          = condenseNodeWeights(std::move(node_weights), reverse_map);
+    MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids);
+    distributeMetisInput(comm, input);
     auto retval                           = invokeMetisPartitioner(domain_data.n_elements,
                                          util::exactIntegerCast< idx_t >(reverse_map.size()),
-                                         prepMetisInput(mesh, domain_data, forward_map, domain_ids),
+                                         input,
                                          std::move(node_weights),
                                          std::move(part_weights),
-                                         n_parts);
+                                         comm.getSize());
     retval.npart                          = uncondenseNodes(retval.epart, retval.npart, reverse_map, mesh, domain_ids);
     return retval;
 }
@@ -439,7 +467,7 @@ void renumberNodes(util::ArrayOwner< std::map< d_id_t, Domain< orders... > > >& 
 
 template < el_o_t... orders >
 auto partitionMeshImpl(const MeshPartition< orders... >& mesh,
-                       idx_t                             n_parts,
+                       const MpiComm&                    comm,
                        const util::ArrayOwner< d_id_t >& boundary_ids,
                        util::ArrayOwner< real_t >        part_weights,
                        util::ArrayOwner< idx_t >         node_weights) -> util::ArrayOwner< MeshPartition< orders... > >
@@ -447,10 +475,10 @@ auto partitionMeshImpl(const MeshPartition< orders... >& mesh,
     const auto domain_ids  = getDomainIds(mesh, boundary_ids);
     const auto domain_data = getDomainData(mesh, domain_ids);
     auto [epart, npart]    = partitionCondensedMesh(
-        mesh, domain_ids, domain_data, n_parts, std::move(part_weights), std::move(node_weights));
-    auto new_domain_maps = makeDomainMaps(mesh, n_parts, epart, domain_ids);
+        mesh, domain_ids, domain_data, comm, std::move(part_weights), std::move(node_weights));
+    auto new_domain_maps = makeDomainMaps(mesh, comm.getSize(), epart, domain_ids);
     assignBoundaryElements(mesh, epart, new_domain_maps, domain_ids, boundary_ids, domain_data.n_elements);
-    auto node_vecs = assignNodes(n_parts, npart, new_domain_maps);
+    auto node_vecs = assignNodes(comm.getSize(), npart, new_domain_maps);
     renumberNodes(new_domain_maps, node_vecs);
     return makeMeshFromPartitionComponents(std::move(new_domain_maps), std::move(node_vecs), boundary_ids);
 }
@@ -458,7 +486,7 @@ auto partitionMeshImpl(const MeshPartition< orders... >& mesh,
 
 template < el_o_t... orders, size_t max_dofs_per_node = 0 >
 auto partitionMesh(const MeshPartition< orders... >&             mesh,
-                   idx_t                                         n_parts,
+                   const MpiComm&                                comm,
                    util::ArrayOwner< real_t >                    part_weights = {},
                    const ProblemDefinition< max_dofs_per_node >& problem_def  = {})
     -> util::ArrayOwner< MeshPartition< orders... > >
@@ -467,9 +495,9 @@ auto partitionMesh(const MeshPartition< orders... >&             mesh,
     util::throwingAssert(mesh.getNodeOwnership().shared().empty() and
                              mesh.getNodeOwnership().owned().back() == mesh.getNodeOwnership().owned().size() - 1,
                          "You cannot partition a mesh which has already been partitioned");
-    util::throwingAssert(n_parts >= 1, "The number of resulting partitions cannot be smaller than 1");
+    util::throwingAssert(comm.getSize() >= 1, "The number of resulting partitions cannot be smaller than 1");
 
-    if (n_parts == 1)
+    if (comm.getSize() == 1)
     {
         auto retval    = util::ArrayOwner< MeshPartition< orders... > >(1);
         retval.front() = copy(mesh);
@@ -478,7 +506,19 @@ auto partitionMesh(const MeshPartition< orders... >&             mesh,
 
     const auto boundary_ids = mesh.getBoundaryIdsCopy();
     auto       node_wgts    = detail::computeNodeWeights(mesh, problem_def);
-    return detail::partitionMeshImpl(mesh, n_parts, boundary_ids, std::move(part_weights), std::move(node_wgts));
+    return detail::partitionMeshImpl(mesh, comm, boundary_ids, std::move(part_weights), std::move(node_wgts));
 }
+
+template < el_o_t... orders>
+auto participateInMetisCall(const MpiComm& comm, const MeshPartition< orders... >& empty)
+{
+    detail::MetisInput input{};
+    detail::distributeMetisInput(comm, input);
+    detail::MetisOutput output{};
+    //sendBackMetisOutput();
+    return util::ArrayOwner< MeshPartition< orders... > >{};
+}
+
 } // namespace lstr::mesh
+
 #endif // L3STER_MESH_PARTITIONMESH_HPP

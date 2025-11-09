@@ -233,8 +233,8 @@ auto distributeMesh(const MpiComm&                                comm,
 
     const auto node_throughputs = comm::gatherNodeThroughputs(comm);
     const auto mesh             = comm.getRank() == 0 ? std::invoke(mesh_generator) : partition_t{};
-    auto       mesh_parted = comm.getRank() == 0 ? partitionMesh(mesh, comm.getSize(), node_throughputs, problem_def)
-                                                 : util::ArrayOwner< partition_t >{};
+    auto       mesh_parted = comm.getRank() == 0 ? partitionMesh(mesh, comm, node_throughputs, problem_def)
+                                                 : participateInMetisCall(comm, mesh);
     mesh_parted            = detail::permuteMesh(comm, std::move(mesh_parted), problem_def, opts);
     if (comm.getRank() == 0)
     {
