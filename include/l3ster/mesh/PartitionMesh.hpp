@@ -9,6 +9,7 @@
 #include "l3ster/util/DynamicBitset.hpp"
 #include "l3ster/util/MetisUtils.hpp"
 #include "l3ster/util/RobinHoodHashTables.hpp"
+#include "parmetis.h"
 
 #include <vector>
 
@@ -83,7 +84,7 @@ auto getDomainData(const MeshPartition< orders... >& mesh, const util::ArrayOwne
 
 struct MetisInput
 {
-    std::vector< idx_t > e_ind, e_ptr;
+    std::vector< idx_t > e_ind, e_ptr, e_dist;
 };
 template < el_o_t... orders >
 auto prepMetisInput(const MeshPartition< orders... >& part,
@@ -92,7 +93,7 @@ auto prepMetisInput(const MeshPartition< orders... >& part,
                     const util::ArrayOwner< d_id_t >& domain_ids) -> MetisInput
 {
     auto retval          = MetisInput{};
-    auto& [e_ind, e_ptr] = retval;
+    auto& [e_ind, e_ptr, e_dist] = retval;
     e_ind.reserve(domain_data.topology_size);
     e_ptr.reserve(domain_data.n_elements + 1);
     e_ptr.push_back(0);
@@ -182,6 +183,50 @@ inline auto invokeMetisPartitioner(idx_t                      n_els,
     return retval;
 }
 
+inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm)
+{
+    auto& [e_ind, e_ptr, e_dist] = metis_input;
+    auto  metis_options = makeMetisOptionsForPartitioning();
+    auto  retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(e_ptr.size() - 1), .npart = util::ArrayOwner< idx_t >(e_ind.size())};
+
+    idx_t wtgflag = 0;
+    idx_t numflag = 0;
+    idx_t ncon = 1;
+    idx_t ncommonnodes = 1;
+    idx_t nparts = comm.getSize();
+    idx_t edgecut = 0;
+
+    std::vector<real_t> tpwgts(ncon * nparts);
+    std::vector<real_t> ubvec(ncon);
+
+    for(int i=0;i<ncon * nparts;i++)
+    {
+        tpwgts[i] = 1.0/nparts;
+    }
+    for(int i=0;i<ncon;i++)
+    {
+        ubvec[i] = 1.05;
+    }
+    const auto error_code = ParMETIS_V3_PartMeshKway(e_dist.data(),
+                                                     e_ptr.data(),
+                                                     e_ind.data(),
+                                                     nullptr,
+                                                     &wtgflag,
+                                                     &numflag,
+                                                     &ncon,
+                                                     &ncommonnodes,
+                                                     &nparts,
+                                                     tpwgts.data(),
+                                                     ubvec.data(),
+                                                     metis_options.data(),
+                                                     &edgecut,
+                                                     retval.npart.data(),
+                                                     comm.getRef());
+
+    util::metis::handleMetisErrorCode(error_code);
+    return retval;
+}
+
 template < el_o_t... orders >
 auto uncondenseNodes(const util::ArrayOwner< idx_t >&  epart,
                      const util::ArrayOwner< idx_t >&  npart_cond,
@@ -204,11 +249,36 @@ auto uncondenseNodes(const util::ArrayOwner< idx_t >&  epart,
     return retval;
 }
 
-void distributeMetisInput(const MpiComm& comm, detail::MetisInput& input)
+void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_offset)
 {
     int rank = comm.getRank();
     int comm_size = comm.getSize();
-    auto& [e_ind, e_ptr] = input; 
+    MPI_Comm* kom = comm.getRef();
+
+    if(rank == 0)
+    {
+        int offset = rank_0_offset;
+        for(int i=1;i<comm_size;i++)
+        {
+            MPI_Status stat;
+            int size;
+            MPI_Probe(i, 0, *kom, &stat);
+            MPI_Get_elements(&stat, MPI_INT, &size);
+            MPI_Recv(output.npart.data() + offset, size, MPI_INT, i, 0, *kom, &stat);
+            offset += size;
+        }
+    }
+    else
+    {
+        MPI_Send(output.npart.data(), output.npart.size(), MPI_INT, 0, 0, *kom);
+    }
+}
+
+void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
+{
+    int rank = comm.getRank();
+    int comm_size = comm.getSize();
+    auto& [e_ind, e_ptr, e_dist] = input; 
     if(rank == 0)
     {
         //e_ind, e_ptr, indexy, poczatki kolejnych elementow w tablicy
@@ -248,41 +318,63 @@ void distributeMetisInput(const MpiComm& comm, detail::MetisInput& input)
         {
             reduced_ptr[i - 1].resize(info[1] + 1);
             std::memcpy(reduced_ptr[i - 1].data(), e_ptr.data() + offset, sizeof(idx_t) * info[1]);
-            reduced_ptr[i - 1][info[1]] = reduced_indexes[i][0];
             offset += info[1];
             reqs[i - 1] = comm.sendAsync(reduced_ptr[i - 1], i, 2);
         }
         reduced_ptr[comm_size - 2].resize(info[0] - (comm_size - 1) * info[1] + 1);
         std::memcpy(reduced_ptr[comm_size - 2].data(), e_ptr.data() + offset, sizeof(idx_t) * (info[0] - (comm_size - 1) * info[1]));
-        reduced_ptr[comm_size - 2][info[0] - (comm_size - 1) * info[1]] = e_ind.size();
         reqs[comm_size - 2] = comm.sendAsync(reduced_ptr[comm_size - 2], comm_size - 1, 2);
         MpiComm::Request::waitAll(reqs);
+
+        e_dist.resize(comm_size + 1);
+        e_dist[0] = 0;
+        for(int i=1;i<comm_size;i++)
+        {
+            e_dist[i] = e_dist[i - 1] + info[1];
+        }
+        e_dist[comm_size] = info[0];
     }
     else
     {
         std::vector<idx_t> info(2);
         comm.broadcast(info, 0);
 
+        idx_t rest = 0;
         if(rank == comm_size - 1)
         {
-            idx_t rest = info[0] - info[1] * comm_size;
-            info[1] += rest;
+            rest = info[0] - info[1] * comm_size;
         }
-        e_ptr.resize(info[1] + 1);
+        e_ptr.resize(info[1] + rest + 1);
         
         std::vector<idx_t> n_indexes(1);
         comm.receive(n_indexes, 0, 0);
         e_ind.resize(n_indexes[0]);
         comm.receive(e_ind, 0, 1);
         comm.receive(e_ptr, 0, 2);
+        e_ptr[e_ptr.size() - 1] = e_ind.size() + e_ptr[0];
+
+        idx_t ptr_offset = e_ptr[0];
+        for(int i=0;i<e_ptr.size();i++)
+        {
+            e_ptr[i] = e_ptr[i] - ptr_offset;
+        }
+
+        e_dist.resize(comm_size + 1);
+        e_dist[0] = 0;
+        for(int i=1;i<comm_size;i++)
+        {
+            e_dist[i] = e_dist[i - 1] + info[1];
+        }
+        e_dist[comm_size] = info[0];
     }
+    comm.barrier();
 }
 
 template < el_o_t... orders >
 auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
                             const util::ArrayOwner< d_id_t >& domain_ids,
                             DomainData                        domain_data,
-                            const MpiComm&                    comm,
+                            MpiComm&                    comm,
                             util::ArrayOwner< real_t >        part_weights,
                             util::ArrayOwner< idx_t >         node_weights) -> MetisOutput
 {
@@ -290,13 +382,25 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
     node_weights                          = condenseNodeWeights(std::move(node_weights), reverse_map);
     MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids);
     distributeMetisInput(comm, input);
-    auto retval                           = invokeMetisPartitioner(domain_data.n_elements,
-                                         util::exactIntegerCast< idx_t >(reverse_map.size()),
-                                         input,
-                                         std::move(node_weights),
-                                         std::move(part_weights),
-                                         comm.getSize());
+    auto retval = invokeParallelMetisPartitioner(input, comm);
+    int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
+    gatherMetisOutput(comm, retval, input.e_ptr[n_elems_per_core] - input.e_ptr[0]);
+    idx_t n_els = domain_data.n_elements;
+    idx_t n_els_per_core = n_els/comm.getSize();
+    for(int i=0;i<comm.getSize();i++)
+    {
+        for(int j=0;j<n_els_per_core;j++)
+        {
+            retval.epart[i * n_els_per_core + j] = i;
+        }
+    }
+    for(int i=n_els_per_core * comm.getSize();i<n_els;i++)
+    {
+        retval.epart[i] = comm.getSize() - 1;
+    }
+
     retval.npart                          = uncondenseNodes(retval.epart, retval.npart, reverse_map, mesh, domain_ids);
+
     return retval;
 }
 
@@ -515,7 +619,7 @@ void renumberNodes(util::ArrayOwner< std::map< d_id_t, Domain< orders... > > >& 
 
 template < el_o_t... orders >
 auto partitionMeshImpl(const MeshPartition< orders... >& mesh,
-                       const MpiComm&                    comm,
+                       MpiComm&                    comm,
                        const util::ArrayOwner< d_id_t >& boundary_ids,
                        util::ArrayOwner< real_t >        part_weights,
                        util::ArrayOwner< idx_t >         node_weights) -> util::ArrayOwner< MeshPartition< orders... > >
@@ -528,13 +632,14 @@ auto partitionMeshImpl(const MeshPartition< orders... >& mesh,
     assignBoundaryElements(mesh, epart, new_domain_maps, domain_ids, boundary_ids, domain_data.n_elements);
     auto node_vecs = assignNodes(comm.getSize(), npart, new_domain_maps);
     renumberNodes(new_domain_maps, node_vecs);
+
     return makeMeshFromPartitionComponents(std::move(new_domain_maps), std::move(node_vecs), boundary_ids);
 }
 } // namespace detail
 
 template < el_o_t... orders, size_t max_dofs_per_node = 0 >
 auto partitionMesh(const MeshPartition< orders... >&             mesh,
-                   const MpiComm&                                comm,
+                   MpiComm&                                comm,
                    util::ArrayOwner< real_t >                    part_weights = {},
                    const ProblemDefinition< max_dofs_per_node >& problem_def  = {})
     -> util::ArrayOwner< MeshPartition< orders... > >
@@ -558,12 +663,13 @@ auto partitionMesh(const MeshPartition< orders... >&             mesh,
 }
 
 template < el_o_t... orders>
-auto participateInMetisCall(const MpiComm& comm, const MeshPartition< orders... >& empty)
+auto participateInMetisCall(MpiComm& comm, const MeshPartition< orders... >& empty)
 {
     detail::MetisInput input{};
     detail::distributeMetisInput(comm, input);
-    detail::MetisOutput output{};
-    //sendBackMetisOutput();
+    auto retval = invokeParallelMetisPartitioner(input, comm);
+    detail::gatherMetisOutput(comm, retval, 0);
+
     return util::ArrayOwner< MeshPartition< orders... > >{};
 }
 

@@ -5,7 +5,7 @@ int main(int argc, char* argv[])
     using namespace lstr;
 
     const auto scope_guard = L3sterScopeGuard{argc, argv};
-    const auto comm        = std::make_shared< MpiComm >(MPI_COMM_WORLD);
+    auto comm        = std::make_shared< MpiComm >(MPI_COMM_WORLD);
 
     // Physical region IDs - these were set in Gmsh
     constexpr int domain = 44, inlet = 45, wall = 46, outlet = 47;
@@ -26,6 +26,7 @@ int main(int argc, char* argv[])
     constexpr int     mesh_order = 4;
     const auto        mesh =
         readAndDistributeMesh< mesh_order >(*comm, mesh_file, mesh::gmsh_tag, {inlet, wall, outlet}, {}, problem_def);
+    
 
     // Algebraic system used for both the steady and transient problems
     auto algebraic_system = makeAlgebraicSystem(comm, mesh, problem_def, bc_def);

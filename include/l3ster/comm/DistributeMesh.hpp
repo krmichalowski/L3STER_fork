@@ -102,7 +102,7 @@ auto makeCommVolumeInfo(const util::ArrayOwner< mesh::MeshPartition< orders... >
 }
 
 template < el_o_t... orders, size_t max_dofs_per_node >
-auto computeOptimizedRankPermutation(const MpiComm&                                              comm,
+auto computeOptimizedRankPermutation(MpiComm&                                              comm,
                                      const util::ArrayOwner< mesh::MeshPartition< orders... > >& mesh_parts,
                                      const ProblemDefinition< max_dofs_per_node >&               problem_def)
     -> util::ArrayOwner< int >
@@ -130,7 +130,7 @@ auto computeOptimizedRankPermutation(const MpiComm&                             
 }
 
 template < el_o_t... orders, size_t max_dofs_per_node >
-auto permuteMesh(const MpiComm&                                       comm,
+auto permuteMesh(MpiComm&                                       comm,
                  util::ArrayOwner< mesh::MeshPartition< orders... > > mesh_parts,
                  const ProblemDefinition< max_dofs_per_node >&        problem_def,
                  const MeshDistOpts& opts) -> util::ArrayOwner< mesh::MeshPartition< orders... > >
@@ -153,7 +153,7 @@ auto permuteMesh(const MpiComm&                                       comm,
 } // namespace detail
 
 template < el_o_t... orders >
-void sendMesh(const MpiComm&                                comm,
+void sendMesh(MpiComm&                                comm,
               const mesh::MeshPartition< orders... >&       mesh,
               int                                           dest_rank,
               std::output_iterator< MpiComm::Request > auto reqs_out)
@@ -181,7 +181,7 @@ void sendMesh(const MpiComm&                                comm,
 }
 
 template < el_o_t... orders >
-auto receiveMesh(const MpiComm& comm, int src_rank) -> mesh::MeshPartition< orders... >
+auto receiveMesh(MpiComm& comm, int src_rank) -> mesh::MeshPartition< orders... >
 {
     constexpr size_t glob_params    = 3;
     constexpr size_t num_elem_types = mesh::Domain< orders... >::el_univec_t::num_types;
@@ -214,14 +214,14 @@ auto receiveMesh(const MpiComm& comm, int src_rank) -> mesh::MeshPartition< orde
 }
 
 template < el_o_t... orders >
-auto receiveMesh(const MpiComm& comm, int src_rank, util::TypePack< mesh::MeshPartition< orders... > >)
+auto receiveMesh(MpiComm& comm, int src_rank, util::TypePack< mesh::MeshPartition< orders... > >)
     -> mesh::MeshPartition< orders... >
 {
     return receiveMesh< orders... >(comm, src_rank);
 }
 
 template < typename MeshGenerator, size_t max_dofs_per_node = 0 >
-auto distributeMesh(const MpiComm&                                comm,
+auto distributeMesh(MpiComm&                                comm,
                     MeshGenerator&&                               mesh_generator,
                     const ProblemDefinition< max_dofs_per_node >& problem_def = {},
                     const MeshDistOpts&                           opts        = {})
@@ -251,7 +251,7 @@ auto distributeMesh(const MpiComm&                                comm,
 } // namespace comm
 
 template < el_o_t order, GeneratorFor_c< mesh::MeshPartition< 1 > > Generator, size_t max_dofs_per_node = 0 >
-auto generateAndDistributeMesh(const MpiComm&                                comm,
+auto generateAndDistributeMesh(MpiComm&                                comm,
                                Generator&&                                   mesh_generator,
                                util::ConstexprValue< order >                 order_ctwrpr = {},
                                const ProblemDefinition< max_dofs_per_node >& problem_def  = {},
@@ -268,7 +268,7 @@ auto generateAndDistributeMesh(const MpiComm&                                com
 }
 
 template < el_o_t order, mesh::MeshFormat mesh_format, size_t max_dofs_per_node = 0 >
-auto readAndDistributeMesh(const MpiComm&                                comm,
+auto readAndDistributeMesh(MpiComm&                                comm,
                            std::string_view                              mesh_file,
                            mesh::MeshFormatTag< mesh_format >            format_tag,
                            const util::ArrayOwner< d_id_t >&             boundaries,
@@ -283,7 +283,7 @@ auto readAndDistributeMesh(const MpiComm&                                comm,
 }
 
 template < el_o_t order, GeneratorFor_c< mesh::MeshPartition< 1 > > Generator, ProblemDef problem_def >
-[[deprecated]] auto generateAndDistributeMesh(const MpiComm&                comm,
+[[deprecated]] auto generateAndDistributeMesh(MpiComm&                comm,
                                               Generator&&                   mesh_generator,
                                               util::ConstexprValue< order > order_ctwrpr,
                                               util::ConstexprValue< problem_def >,
@@ -295,7 +295,7 @@ template < el_o_t order, GeneratorFor_c< mesh::MeshPartition< 1 > > Generator, P
 }
 
 template < el_o_t order, mesh::MeshFormat mesh_format, ProblemDef problem_def >
-[[deprecated]] auto readAndDistributeMesh(const MpiComm&                     comm,
+[[deprecated]] auto readAndDistributeMesh(MpiComm&                     comm,
                                           std::string_view                   mesh_file,
                                           mesh::MeshFormatTag< mesh_format > format_tag,
                                           const util::ArrayOwner< d_id_t >&  boundaries,

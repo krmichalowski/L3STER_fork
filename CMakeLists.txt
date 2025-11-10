@@ -59,9 +59,6 @@ list( APPEND L3STER_IMPORTED_DEPENDENCIES hwloc-import )
 list( APPEND L3STER_DEPENDENCIES hwloc-import )
 
 # Metis
-importlibrary( metis REQUIRED )
-list( APPEND L3STER_IMPORTED_DEPENDENCIES metis-import )
-list( APPEND L3STER_DEPENDENCIES metis-import )
 
 #######################################################################################################################
 
