@@ -12,6 +12,7 @@
 #include "parmetis.h"
 
 #include <vector>
+#include <limits>
 
 // Note on naming: the uninformative names such as eptr, nparts, etc. are inherited from the METIS documentation
 namespace lstr::mesh
@@ -183,13 +184,11 @@ inline auto invokeMetisPartitioner(idx_t                      n_els,
     return retval;
 }
 
-inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm)
+inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes)
 {
     auto& [e_ind, e_ptr, e_dist] = metis_input;
     auto  metis_options = makeMetisOptionsForPartitioning();
-    //tu w npart trzeba zmienic zeby npart mialo tylko tyle ile jest wezlow globalnch a w e_ind sie powtarzaja, musi to dzialac tylko na rank 0
-    //na inncyh moze byc po prostu 0
-    auto  retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(e_ptr.size() - 1), .npart = util::ArrayOwner< idx_t >(e_ind.size())};
+    auto  retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(e_ptr.size() - 1), .npart = util::ArrayOwner< idx_t >(n_nodes)};
 
     idx_t wtgflag = 0;
     idx_t numflag = 0;
@@ -257,8 +256,7 @@ void determineNodeOwnership(detail::MetisOutput& output, detail::MetisInput& inp
     auto& [e_ind, e_ptr, e_dist] = input;
     for(int i=0;i<npart.size();i++)
     {
-        //potem zmienic to na cos z numeric limits, max int
-        npart[i] = 1000000;
+        npart[i] = std::numeric_limits<int>::max();
     }
 
     for(int i=0;i<e_ptr.size()-1;i++)
@@ -411,7 +409,7 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
     node_weights                          = condenseNodeWeights(std::move(node_weights), reverse_map);
     MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids);
     distributeMetisInput(comm, input);
-    auto retval = invokeParallelMetisPartitioner(input, comm);
+    auto retval = invokeParallelMetisPartitioner(input, comm, mesh.getNNodes());
     int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
     gatherMetisOutput(comm, retval, n_elems_per_core);
     idx_t n_els = domain_data.n_elements;
@@ -585,6 +583,7 @@ auto assignNodes(idx_t                                                          
         new_node_vecs[part_ind].back()  = vec_from_set(ghost_nodes);
         ++part_ind;
     }
+
     reassignDisjointNodes(new_node_vecs, disjoint_nodes);
     return new_node_vecs;
 }
@@ -686,7 +685,7 @@ auto participateInMetisCall(MpiComm& comm, const MeshPartition< orders... >& emp
 {
     detail::MetisInput input{};
     detail::distributeMetisInput(comm, input);
-    auto retval = invokeParallelMetisPartitioner(input, comm);
+    auto retval = invokeParallelMetisPartitioner(input, comm, 0);
     detail::gatherMetisOutput(comm, retval, 0);
 
     return util::ArrayOwner< MeshPartition< orders... > >{};
