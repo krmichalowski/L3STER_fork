@@ -308,10 +308,9 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
     auto& [e_ind, e_ptr, e_dist] = input; 
     if(rank == 0)
     {
-        //e_ind, e_ptr, indexy, poczatki kolejnych elementow w tablicy
         std::vector<idx_t> info(2);
-        info[0] = e_ptr.size() - 1; //n elems
-        info[1] = info[0]/comm_size; //n elems per rank
+        info[0] = e_ptr.size() - 1;
+        info[1] = info[0]/comm_size;
         comm.broadcast(info, 0);
 
         std::vector<std::vector<idx_t>> n_indexes(comm_size - 1);
@@ -394,7 +393,6 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
         }
         e_dist[comm_size] = info[0];
     }
-    comm.barrier();
 }
 
 template < el_o_t... orders >
