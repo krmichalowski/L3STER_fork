@@ -187,6 +187,8 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
 {
     auto& [e_ind, e_ptr, e_dist] = metis_input;
     auto  metis_options = makeMetisOptionsForPartitioning();
+    //tu w npart trzeba zmienic zeby npart mialo tylko tyle ile jest wezlow globalnch a w e_ind sie powtarzaja, musi to dzialac tylko na rank 0
+    //na inncyh moze byc po prostu 0
     auto  retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(e_ptr.size() - 1), .npart = util::ArrayOwner< idx_t >(e_ind.size())};
 
     idx_t wtgflag = 0;
@@ -220,7 +222,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
                                                      ubvec.data(),
                                                      metis_options.data(),
                                                      &edgecut,
-                                                     retval.npart.data(),
+                                                     retval.epart.data(),
                                                      comm.getRef());
 
     util::metis::handleMetisErrorCode(error_code);
@@ -249,6 +251,33 @@ auto uncondenseNodes(const util::ArrayOwner< idx_t >&  epart,
     return retval;
 }
 
+void determineNodeOwnership(detail::MetisOutput& output, detail::MetisInput& input)
+{
+    auto& [epart, npart] = output;
+    auto& [e_ind, e_ptr, e_dist] = input;
+    for(int i=0;i<npart.size();i++)
+    {
+        //potem zmienic to na cos z numeric limits, max int
+        npart[i] = 1000000;
+    }
+
+    for(int i=0;i<e_ptr.size()-1;i++)
+    {
+        int beg = e_ptr[i];
+        int end = e_ptr[i+1];
+        int elem_owner = epart[i];
+
+        for(int j=beg;j<end;j++)
+        {
+            int n_id = e_ind[j];
+            if(npart[n_id] > elem_owner)
+            {
+                npart[n_id] = elem_owner;
+            }
+        }
+    }
+}
+
 void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_offset)
 {
     int rank = comm.getRank();
@@ -264,13 +293,13 @@ void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_of
             int size;
             MPI_Probe(i, 0, *kom, &stat);
             MPI_Get_elements(&stat, MPI_INT, &size);
-            MPI_Recv(output.npart.data() + offset, size, MPI_INT, i, 0, *kom, &stat);
+            MPI_Recv(output.epart.data() + offset, size, MPI_INT, i, 0, *kom, &stat);
             offset += size;
         }
     }
     else
     {
-        MPI_Send(output.npart.data(), output.npart.size(), MPI_INT, 0, 0, *kom);
+        MPI_Send(output.epart.data(), output.epart.size(), MPI_INT, 0, 0, *kom);
     }
 }
 
@@ -384,20 +413,10 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
     distributeMetisInput(comm, input);
     auto retval = invokeParallelMetisPartitioner(input, comm);
     int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
-    gatherMetisOutput(comm, retval, input.e_ptr[n_elems_per_core] - input.e_ptr[0]);
+    gatherMetisOutput(comm, retval, n_elems_per_core);
     idx_t n_els = domain_data.n_elements;
     idx_t n_els_per_core = n_els/comm.getSize();
-    for(int i=0;i<comm.getSize();i++)
-    {
-        for(int j=0;j<n_els_per_core;j++)
-        {
-            retval.epart[i * n_els_per_core + j] = i;
-        }
-    }
-    for(int i=n_els_per_core * comm.getSize();i<n_els;i++)
-    {
-        retval.epart[i] = comm.getSize() - 1;
-    }
+    determineNodeOwnership(retval, input);
 
     retval.npart                          = uncondenseNodes(retval.epart, retval.npart, reverse_map, mesh, domain_ids);
 
