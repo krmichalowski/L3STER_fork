@@ -255,7 +255,7 @@ public:
     [[nodiscard]] inline int getRank() const;
     [[nodiscard]] inline int getSize() const;
     [[nodiscard]] MPI_Comm   get() const { return m_comm; }
-    MPI_Comm* getRef() { return &m_comm; }
+    MPI_Comm*   getRef() { return &m_comm; }
 
     // topology-related
     template < ContiguousSizedRangeOf< int > Src,

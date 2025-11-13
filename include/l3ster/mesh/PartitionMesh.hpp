@@ -13,6 +13,7 @@
 
 #include <vector>
 #include <limits>
+#include <span>
 
 // Note on naming: the uninformative names such as eptr, nparts, etc. are inherited from the METIS documentation
 namespace lstr::mesh
@@ -280,24 +281,22 @@ void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_of
 {
     int rank = comm.getRank();
     int comm_size = comm.getSize();
-    MPI_Comm* kom = comm.getRef();
 
     if(rank == 0)
     {
+        std::span s(output.epart);
+
         int offset = rank_0_offset;
         for(int i=1;i<comm_size;i++)
         {
-            MPI_Status stat;
-            int size;
-            MPI_Probe(i, 0, *kom, &stat);
-            MPI_Get_elements(&stat, MPI_INT, &size);
-            MPI_Recv(output.epart.data() + offset, size, MPI_INT, i, 0, *kom, &stat);
+            int size = comm.probe(i, 0).numElems<int>();
+            comm.receive(s.subspan(offset, size), i, 0);
             offset += size;
         }
     }
     else
     {
-        MPI_Send(output.epart.data(), output.epart.size(), MPI_INT, 0, 0, *kom);
+        comm.send(output.epart, 0, 0);
     }
 }
 
@@ -325,31 +324,24 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
         n_indexes[comm_size - 2][0] = e_ptr[e_ptr.size() - 1] - e_ptr[(comm_size - 1) * info[1]];
         reqs[comm_size - 2] = comm.sendAsync(n_indexes[comm_size - 2], comm_size - 1, 0);
         MpiComm::Request::waitAll(reqs);
-
-        std::vector<std::vector<idx_t>> reduced_indexes(comm_size - 1);
-        std::vector<std::vector<idx_t>> reduced_ptr(comm_size - 1);
         
         idx_t offset = e_ptr[info[1]] - e_ptr[0];
+        std::span s_eind(e_ind);
         for(int i=1;i<comm_size;i++)
         {
-            reduced_indexes[i - 1].resize(n_indexes[i - 1][0]);
-            std::memcpy(reduced_indexes[i - 1].data(), e_ind.data() + offset, sizeof(idx_t) * n_indexes[i - 1][0]);
+            reqs[i - 1] = comm.sendAsync(s_eind.subspan(offset, n_indexes[i - 1][0]), i, 1);
             offset += n_indexes[i - 1][0];
-            reqs[i - 1] = comm.sendAsync(reduced_indexes[i - 1], i, 1);
         }
         MpiComm::Request::waitAll(reqs);
 
         offset = info[1];
+        std::span s_eptr(e_ptr);
         for(int i=1;i<comm_size - 1;i++)
         {
-            reduced_ptr[i - 1].resize(info[1] + 1);
-            std::memcpy(reduced_ptr[i - 1].data(), e_ptr.data() + offset, sizeof(idx_t) * info[1]);
+            reqs[i - 1] = comm.sendAsync(s_eptr.subspan(offset, info[1] + 1), i, 2);
             offset += info[1];
-            reqs[i - 1] = comm.sendAsync(reduced_ptr[i - 1], i, 2);
         }
-        reduced_ptr[comm_size - 2].resize(info[0] - (comm_size - 1) * info[1] + 1);
-        std::memcpy(reduced_ptr[comm_size - 2].data(), e_ptr.data() + offset, sizeof(idx_t) * (info[0] - (comm_size - 1) * info[1]));
-        reqs[comm_size - 2] = comm.sendAsync(reduced_ptr[comm_size - 2], comm_size - 1, 2);
+        reqs[comm_size - 2] = comm.sendAsync(s_eptr.subspan(offset, info[0] - (comm_size - 1) * info[1] + 1), comm_size - 1, 2);
         MpiComm::Request::waitAll(reqs);
 
         e_dist.resize(comm_size + 1);
@@ -377,7 +369,6 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
         e_ind.resize(n_indexes[0]);
         comm.receive(e_ind, 0, 1);
         comm.receive(e_ptr, 0, 2);
-        e_ptr[e_ptr.size() - 1] = e_ind.size() + e_ptr[0];
 
         idx_t ptr_offset = e_ptr[0];
         for(int i=0;i<e_ptr.size();i++)
