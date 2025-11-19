@@ -92,20 +92,40 @@ template < el_o_t... orders >
 auto prepMetisInput(const MeshPartition< orders... >& part,
                     const DomainData&                 domain_data,
                     const std::vector< n_id_t >&      cond_map,
-                    const util::ArrayOwner< d_id_t >& domain_ids) -> MetisInput
+                    const util::ArrayOwner< d_id_t >& domain_ids,
+                    std::vector<Point<3>>& elem_centers) -> MetisInput
 {
     auto retval          = MetisInput{};
     auto& [e_ind, e_ptr, e_dist] = retval;
     e_ind.reserve(domain_data.topology_size);
     e_ptr.reserve(domain_data.n_elements + 1);
     e_ptr.push_back(0);
+    int el_id = 0;
     const auto condense = [&]< ElementType ET, el_o_t EO >(const Element< ET, EO >& element) {
         const auto condensed_view =
             getBoundaryNodes(element) | std::views::transform([&](auto n) { return cond_map[n]; });
         std::ranges::copy(condensed_view, std::back_inserter(e_ind));
         e_ptr.push_back(static_cast< idx_t >(e_ptr.back() + std::ranges::ssize(condensed_view)));
+
+        size_t n_verts = element.data.vertices.size();
+        elem_centers[el_id][0] = 0.0;
+        elem_centers[el_id][1] = 0.0;
+        elem_centers[el_id][2] = 0.0;
+        for(int i=0;i<element.data.vertices.size();i++)
+        {
+            elem_centers[el_id][0] += element.data.vertices[i][0];
+            elem_centers[el_id][1] += element.data.vertices[i][1];
+            elem_centers[el_id][2] += element.data.vertices[i][2];
+        }
+        elem_centers[el_id][0] = elem_centers[el_id][0]/n_verts;
+        elem_centers[el_id][1] = elem_centers[el_id][1]/n_verts;
+        elem_centers[el_id][2] = elem_centers[el_id][2]/n_verts;
+
+        el_id++;
     };
+
     part.visit(condense, domain_ids);
+
     return retval;
 }
 
@@ -300,7 +320,7 @@ void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_of
     }
 }
 
-void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
+void distributeMetisInput(MpiComm& comm, detail::MetisInput& input, std::vector<Point<3>>& elem_centers)
 {
     int rank = comm.getRank();
     int comm_size = comm.getSize();
@@ -351,6 +371,16 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
             e_dist[i] = e_dist[i - 1] + info[1];
         }
         e_dist[comm_size] = info[0];
+
+        offset = info[1];
+        std::span s_centers(elem_centers);
+        for(int i=1;i<comm_size - 1;i++)
+        {
+            reqs[i - 1] = comm.sendAsync(s_centers.subspan(offset, info[1]), i, 3);
+            offset += info[1];
+        }
+        reqs[comm_size - 2] = comm.sendAsync(s_centers.subspan(offset, info[0] - (comm_size - 1) * info[1]), comm_size - 1, 3);
+        MpiComm::Request::waitAll(reqs);
     }
     else
     {
@@ -383,6 +413,9 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input)
             e_dist[i] = e_dist[i - 1] + info[1];
         }
         e_dist[comm_size] = info[0];
+
+        elem_centers.resize(e_ptr.size() - 1);
+        comm.receive(elem_centers, 0, 3); 
     }
 }
 
@@ -396,8 +429,9 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
 {
     const auto [forward_map, reverse_map] = makeNodeCondensationMaps(mesh);
     node_weights                          = condenseNodeWeights(std::move(node_weights), reverse_map);
-    MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids);
-    distributeMetisInput(comm, input);
+    std::vector<Point<3>> elem_centers(mesh.getNInternalElements());
+    MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids, elem_centers);
+    distributeMetisInput(comm, input, elem_centers);
     auto retval = invokeParallelMetisPartitioner(input, comm, mesh.getNNodes());
     int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
     gatherMetisOutput(comm, retval, n_elems_per_core);
@@ -673,7 +707,8 @@ template < el_o_t... orders>
 auto participateInMetisCall(MpiComm& comm, const MeshPartition< orders... >& empty)
 {
     detail::MetisInput input{};
-    detail::distributeMetisInput(comm, input);
+    std::vector<Point<3>> elem_centers;
+    detail::distributeMetisInput(comm, input, elem_centers);
     auto retval = invokeParallelMetisPartitioner(input, comm, 0);
     detail::gatherMetisOutput(comm, retval, 0);
 
