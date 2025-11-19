@@ -205,7 +205,7 @@ inline auto invokeMetisPartitioner(idx_t                      n_els,
     return retval;
 }
 
-inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes)
+inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes, std::vector<Point<3>>& elem_centers)
 {
     auto& [e_ind, e_ptr, e_dist] = metis_input;
     auto  metis_options = makeMetisOptionsForPartitioning();
@@ -217,6 +217,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     idx_t ncommonnodes = 1;
     idx_t nparts = comm.getSize();
     idx_t edgecut = 0;
+    idx_t ndims = 3;
 
     std::vector<real_t> tpwgts(ncon * nparts);
     std::vector<real_t> ubvec(ncon);
@@ -229,14 +230,28 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     {
         ubvec[i] = 1.05;
     }
-    const auto error_code = ParMETIS_V3_PartMeshKway(e_dist.data(),
-                                                     e_ptr.data(),
-                                                     e_ind.data(),
+
+    idx_t* xadj;
+    idx_t* adjncy;
+    ParMETIS_V3_Mesh2Dual(e_dist.data(),
+                          e_ptr.data(),
+                          e_ind.data(),
+                          &numflag,
+                          &ncommonnodes,
+                          &xadj,
+                          &adjncy,
+                          comm.getRef());
+    
+    const auto error_code = ParMETIS_V3_PartGeomKway(e_dist.data(),
+                                                     xadj,
+                                                     adjncy,
+                                                     nullptr,
                                                      nullptr,
                                                      &wtgflag,
                                                      &numflag,
+                                                     &ndims,
+                                                     (real_t*)elem_centers.data(),
                                                      &ncon,
-                                                     &ncommonnodes,
                                                      &nparts,
                                                      tpwgts.data(),
                                                      ubvec.data(),
@@ -432,7 +447,7 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
     std::vector<Point<3>> elem_centers(mesh.getNInternalElements());
     MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids, elem_centers);
     distributeMetisInput(comm, input, elem_centers);
-    auto retval = invokeParallelMetisPartitioner(input, comm, mesh.getNNodes());
+    auto retval = invokeParallelMetisPartitioner(input, comm, mesh.getNNodes(), elem_centers);
     int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
     gatherMetisOutput(comm, retval, n_elems_per_core);
     idx_t n_els = domain_data.n_elements;
@@ -709,7 +724,7 @@ auto participateInMetisCall(MpiComm& comm, const MeshPartition< orders... >& emp
     detail::MetisInput input{};
     std::vector<Point<3>> elem_centers;
     detail::distributeMetisInput(comm, input, elem_centers);
-    auto retval = invokeParallelMetisPartitioner(input, comm, 0);
+    auto retval = invokeParallelMetisPartitioner(input, comm, 0, elem_centers);
     detail::gatherMetisOutput(comm, retval, 0);
 
     return util::ArrayOwner< MeshPartition< orders... > >{};
