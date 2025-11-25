@@ -347,37 +347,38 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input, std::vector<
         info[1] = info[0]/comm_size;
         comm.broadcast(info, 0);
 
-        std::vector<std::vector<idx_t>> n_indexes(comm_size - 1);
+        int n_elems = info[0];
+        int n_elems_per_rank = info[1];
+        int rest_elems = info[0] - comm_size * n_elems_per_rank;
+
+        std::vector<idx_t> n_indexes_per_rank(comm_size - 1);
+        std::vector<idx_t> n_elems_per_rank_v(comm_size - 1);
         std::vector<MpiComm::Request> reqs(comm_size - 1);
         for(int i=1;i<comm_size - 1;i++)
         {
-            n_indexes[i - 1].resize(1);
-            n_indexes[i - 1][0] = e_ptr[(i + 1) * info[1]] - e_ptr[i * info[1]];
-            reqs[i - 1] = comm.sendAsync(n_indexes[i - 1], i, 0);
+            n_indexes_per_rank[i - 1] = e_ptr[(i + 1) * n_elems_per_rank] - e_ptr[i * n_elems_per_rank];
+            n_elems_per_rank_v[i - 1] = n_elems_per_rank;
+            reqs[i - 1] = comm.sendAsync(std::span(&n_indexes_per_rank[i - 1], 1), i, 0);
         }
-        n_indexes[comm_size - 2].resize(1);
-        n_indexes[comm_size - 2][0] = e_ptr[e_ptr.size() - 1] - e_ptr[(comm_size - 1) * info[1]];
-        reqs[comm_size - 2] = comm.sendAsync(n_indexes[comm_size - 2], comm_size - 1, 0);
-        MpiComm::Request::waitAll(reqs);
-        
-        idx_t offset = e_ptr[info[1]] - e_ptr[0];
-        std::span s_eind(e_ind);
-        for(int i=1;i<comm_size;i++)
-        {
-            reqs[i - 1] = comm.sendAsync(s_eind.subspan(offset, n_indexes[i - 1][0]), i, 1);
-            offset += n_indexes[i - 1][0];
-        }
+        n_indexes_per_rank[comm_size - 2] = e_ptr[e_ptr.size() - 1] - e_ptr[(comm_size - 1) * n_elems_per_rank];
+        n_elems_per_rank_v[comm_size - 2] = n_elems_per_rank + rest_elems;
+        reqs[comm_size - 2] = comm.sendAsync(std::span(&n_indexes_per_rank[comm_size - 2], 1), comm_size - 1, 0);
         MpiComm::Request::waitAll(reqs);
 
-        offset = info[1];
-        std::span s_eptr(e_ptr);
-        for(int i=1;i<comm_size - 1;i++)
+        auto send_subspans = [&reqs, &comm, &comm_size]<typename T>(std::span<T>&& span, std::vector<idx_t>& sizes, idx_t init_offset, int tag)
         {
-            reqs[i - 1] = comm.sendAsync(s_eptr.subspan(offset, info[1] + 1), i, 2);
-            offset += info[1];
-        }
-        reqs[comm_size - 2] = comm.sendAsync(s_eptr.subspan(offset, info[0] - (comm_size - 1) * info[1] + 1), comm_size - 1, 2);
-        MpiComm::Request::waitAll(reqs);
+            idx_t offset = init_offset;
+            for(int i=1;i<comm_size;i++)
+            {
+                reqs[i - 1] = comm.sendAsync(span.subspan(offset, sizes[i - 1]), i, tag);
+                offset += sizes[i - 1];
+            }
+            MpiComm::Request::waitAll(reqs);
+        };
+
+        send_subspans(std::span(e_ind), n_indexes_per_rank, e_ptr[n_elems_per_rank] - e_ptr[0], 1);
+        send_subspans(std::span(e_ptr), n_elems_per_rank_v, n_elems_per_rank, 2);
+        send_subspans(std::span(elem_centers), n_elems_per_rank_v, n_elems_per_rank, 3);
 
         e_dist.resize(comm_size + 1);
         e_dist[0] = 0;
@@ -386,51 +387,46 @@ void distributeMetisInput(MpiComm& comm, detail::MetisInput& input, std::vector<
             e_dist[i] = e_dist[i - 1] + info[1];
         }
         e_dist[comm_size] = info[0];
-
-        offset = info[1];
-        std::span s_centers(elem_centers);
-        for(int i=1;i<comm_size - 1;i++)
-        {
-            reqs[i - 1] = comm.sendAsync(s_centers.subspan(offset, info[1]), i, 3);
-            offset += info[1];
-        }
-        reqs[comm_size - 2] = comm.sendAsync(s_centers.subspan(offset, info[0] - (comm_size - 1) * info[1]), comm_size - 1, 3);
-        MpiComm::Request::waitAll(reqs);
     }
     else
     {
         std::vector<idx_t> info(2);
         comm.broadcast(info, 0);
 
-        idx_t rest = 0;
+        int n_elems = info[0];
+        int n_elems_per_rank = info[1];
+        int rest_elems = 0;
+
         if(rank == comm_size - 1)
         {
-            rest = info[0] - info[1] * comm_size;
+            rest_elems = n_elems - n_elems_per_rank * comm_size;
         }
-        e_ptr.resize(info[1] + rest + 1);
         
-        std::vector<idx_t> n_indexes(1);
-        comm.receive(n_indexes, 0, 0);
-        e_ind.resize(n_indexes[0]);
+        idx_t n_indexes;
+        comm.receive(std::span(&n_indexes, 1), 0, 0);
+
+        e_ind.resize(n_indexes);
+        e_ptr.resize(n_elems_per_rank + rest_elems + 1);
         comm.receive(e_ind, 0, 1);
-        comm.receive(e_ptr, 0, 2);
+        comm.receive(std::span(e_ptr).subspan(0, e_ptr.size() - 1), 0, 2);
+        e_ptr[e_ptr.size() - 1] = e_ind.size();
 
         idx_t ptr_offset = e_ptr[0];
-        for(int i=0;i<e_ptr.size();i++)
+        for(int i=0;i<e_ptr.size() - 1;i++)
         {
             e_ptr[i] = e_ptr[i] - ptr_offset;
         }
+
+        elem_centers.resize(e_ptr.size() - 1);
+        comm.receive(elem_centers, 0, 3); 
 
         e_dist.resize(comm_size + 1);
         e_dist[0] = 0;
         for(int i=1;i<comm_size;i++)
         {
-            e_dist[i] = e_dist[i - 1] + info[1];
+            e_dist[i] = e_dist[i - 1] + n_elems_per_rank;
         }
-        e_dist[comm_size] = info[0];
-
-        elem_centers.resize(e_ptr.size() - 1);
-        comm.receive(elem_centers, 0, 3); 
+        e_dist[comm_size] = n_elems;
     }
 }
 
