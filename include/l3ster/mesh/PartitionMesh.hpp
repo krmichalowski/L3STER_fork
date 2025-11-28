@@ -217,7 +217,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     idx_t ncommonnodes = 1;
     idx_t nparts = comm.getSize();
     idx_t edgecut = 0;
-    idx_t ndims = 3;
+    idx_t ndims = 2;
 
     std::vector<real_t> tpwgts(ncon * nparts);
     std::vector<real_t> ubvec(ncon);
