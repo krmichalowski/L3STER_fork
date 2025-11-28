@@ -207,10 +207,22 @@ inline auto invokeMetisPartitioner(idx_t                      n_els,
 
 inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes, std::vector<real_t>& elem_centers)
 {
+    int rank = comm.getRank();
+    int comm_size = comm.getSize();
+
     auto& [e_ind, e_ptr, e_dist] = metis_input;
     auto  metis_options = makeMetisOptionsForPartitioning();
-    auto  retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(e_ptr.size() - 1), .npart = util::ArrayOwner< idx_t >(n_nodes)};
 
+    size_t epart_size = 0;
+    size_t npart_size = 0;
+
+    if(rank == 0)
+    {
+        epart_size = e_ptr.size() - 1;
+        npart_size = n_nodes;
+    }
+
+    auto retval = MetisOutput{.epart = util::ArrayOwner< idx_t >(epart_size), .npart = util::ArrayOwner< idx_t >(npart_size)};
     idx_t wtgflag = 0;
     idx_t numflag = 0;
     idx_t ncon = 1;
@@ -230,9 +242,9 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     {
         ubvec[i] = 1.05;
     }
-
     idx_t* xadj;
     idx_t* adjncy;
+
     ParMETIS_V3_Mesh2Dual(e_dist.data(),
                           e_ptr.data(),
                           e_ind.data(),
@@ -241,6 +253,21 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
                           &xadj,
                           &adjncy,
                           comm.getRef());
+
+    size_t n_local_verts = e_dist[rank + 1] - e_dist[rank];
+    size_t n_local_edges = xadj[n_local_verts + 1];
+    std::vector<idx_t> verts_ids(n_local_verts);
+    std::vector<idx_t> n_edges(n_local_verts);
+    std::vector<idx_t> part(n_local_verts);
+
+    //poczatkowe informacje o grafie, kazdy rank ma pewien ciagly fragment id elementow
+    for(int i=e_dist[rank];i<e_dist[rank + 1];i++)
+    {
+        int local_id = i - e_dist[rank];
+        int global_id = i;
+        verts_ids[local_id] = global_id;
+        n_edges[local_id] = xadj[local_id + 1] - xadj[local_id];
+    }
     
     const auto error_code = ParMETIS_V3_PartGeomKway(e_dist.data(),
                                                      xadj,
@@ -257,10 +284,164 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
                                                      ubvec.data(),
                                                      metis_options.data(),
                                                      &edgecut,
-                                                     retval.epart.data(),
+                                                     part.data(),
                                                      comm.getRef());
-
     util::metis::handleMetisErrorCode(error_code);
+
+    idx_t* new_xadj;
+    idx_t* new_adjncy;    
+    auto update_dist_graph = [&new_xadj, &new_adjncy, &part, &verts_ids, &n_edges, &n_local_verts, &n_local_edges](idx_t*& xadj,
+                                                                                                                   idx_t*& adjncy,
+                                                                                                                   int comm_size,
+                                                                                                                   MpiComm& comm)
+    {
+        std::vector<idx_t> n_verts_for_rank(comm_size, 0);
+        std::vector<idx_t> n_edges_for_rank(comm_size, 0);
+
+        std::vector<idx_t> n_verts_from_rank(comm_size, 0);
+        std::vector<idx_t> n_edges_from_rank(comm_size, 0);
+
+        for(int i=0;i<n_local_verts;i++)
+        {
+            int owner = part[i];
+            n_verts_for_rank[owner]++;
+            n_edges_for_rank[owner] += xadj[i + 1] - xadj[i];
+        }
+
+        for(int i=0;i<comm_size;i++)
+        {
+            MPI_Scatter(n_verts_for_rank.data(), 1, MPI_INT, &n_verts_from_rank[i], 1, MPI_INT, i, comm.get());
+            MPI_Scatter(n_edges_for_rank.data(), 1, MPI_INT, &n_edges_from_rank[i], 1, MPI_INT, i, comm.get());
+        }
+
+        int n_local_edges_old = n_local_edges;
+        int n_local_verts_old = n_local_verts;
+        n_local_edges = std::reduce(n_edges_from_rank.begin(), n_edges_from_rank.end());
+        n_local_verts = std::reduce(n_verts_from_rank.begin(), n_verts_from_rank.end());
+
+        new_adjncy = new idx_t[n_local_edges];
+        new_xadj = new idx_t[n_local_verts + 1];
+        std::vector<idx_t> new_verts_ids, new_n_edges, new_part;
+        new_verts_ids.resize(n_local_verts);
+        new_n_edges.resize(n_local_verts);
+        new_part.resize(n_local_verts);
+
+        std::vector<idx_t> send_vert_ids, send_edges, send_n_edges;
+        send_vert_ids.resize(std::reduce(n_verts_for_rank.begin(), n_verts_for_rank.end()));
+        send_edges.resize(std::reduce(n_edges_for_rank.begin(), n_edges_for_rank.end()));
+        send_n_edges.resize(std::reduce(n_verts_for_rank.begin(), n_verts_for_rank.end()));
+
+        std::vector<idx_t> free_vert_ind(comm_size);
+        std::vector<idx_t> free_edge_ind(comm_size);
+        free_vert_ind[0] = 0;
+        free_edge_ind[0] = 0;
+        for(int i=1;i<comm_size;i++)
+        {
+            free_vert_ind[i] = free_vert_ind[i - 1] + n_verts_for_rank[i - 1];
+            free_edge_ind[i] = free_edge_ind[i - 1] + n_edges_for_rank[i - 1];
+        }
+
+        for(int i=0;i<n_local_verts_old;i++)
+        {
+            int owner = part[i];
+
+            send_vert_ids[free_vert_ind[owner]] = verts_ids[i];
+            send_n_edges[free_vert_ind[owner]++] = n_edges[i];
+            for(int j=xadj[i];j<xadj[i + 1];j++)
+            {
+                send_edges[free_edge_ind[owner]++] = adjncy[j];
+            }
+        }
+
+        std::vector<int> send_displs_verts(comm_size);
+        std::vector<int> send_displs_edges(comm_size);
+        std::vector<int> recv_displs_verts(comm_size);
+        std::vector<int> recv_displs_edges(comm_size);
+        send_displs_verts[0] = 0;
+        send_displs_edges[0] = 0;
+        recv_displs_verts[0] = 0;
+        recv_displs_edges[0] = 0;
+        for(int i=1;i<comm_size;i++)
+        {
+            send_displs_verts[i] = send_displs_verts[i - 1] + n_verts_for_rank[i - 1];
+            send_displs_edges[i] = send_displs_edges[i - 1] + n_edges_for_rank[i - 1];
+
+            recv_displs_verts[i] = recv_displs_verts[i - 1] + n_verts_from_rank[i - 1];
+            recv_displs_edges[i] = recv_displs_edges[i - 1] + n_edges_from_rank[i - 1];
+        }
+
+        for(int i=0;i<comm_size;i++)
+        {
+            MPI_Scatterv(send_vert_ids.data(), n_verts_for_rank.data(), send_displs_verts.data(), MPI_INT,
+                         (void*)(new_verts_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i],
+                         MPI_INT, i, comm.get());
+            MPI_Scatterv(send_n_edges.data(), n_verts_for_rank.data(), send_displs_verts.data(), MPI_INT,
+                         (void*)(new_n_edges.data() + recv_displs_verts[i]), n_verts_from_rank[i],
+                         MPI_INT, i, comm.get());
+            MPI_Scatterv(send_edges.data(), n_edges_for_rank.data(), send_displs_edges.data(), MPI_INT,
+                         (void*)(new_adjncy + recv_displs_edges[i]), n_edges_from_rank[i],
+                         MPI_INT, i, comm.get());
+        }
+
+        delete[] xadj;
+        delete[] adjncy;
+
+        xadj = new_xadj;
+        adjncy = new_adjncy;
+
+        verts_ids = std::move(new_verts_ids);
+        n_edges = std::move(new_n_edges);
+        part.resize(n_local_verts);
+    };
+
+    update_dist_graph(xadj, adjncy, comm_size, comm);
+
+    delete[] adjncy;
+    delete[] xadj;
+
+    std::vector<idx_t> n_elem_ids_from_rank;
+    if(rank == 0)
+    {
+        n_elem_ids_from_rank.resize(comm_size);
+    }
+
+    MPI_Gather(&n_local_verts, 1, MPI_INT, n_elem_ids_from_rank.data(), 1, MPI_INT, 0, comm.get());
+
+    std::vector<idx_t> displs(comm_size);
+    if(rank == 0)
+    {
+        displs[0] = 0;
+        for(int i=1;i<comm_size;i++)
+        {
+            displs[i] = displs[i - 1] + n_elem_ids_from_rank[i - 1];
+        }
+    }
+
+    MPI_Gatherv(verts_ids.data(), n_local_verts, MPI_INT, retval.epart.data(), n_elem_ids_from_rank.data(),
+                displs.data(), MPI_INT, 0, comm.get());
+    
+    if(rank == 0)
+    {
+        std::unordered_map<idx_t, idx_t> el_id_to_rank(retval.epart.size());
+        idx_t curr_rank = 0;
+        for(int i=0;i<retval.epart.size();i++)
+        {
+            el_id_to_rank[retval.epart[i]] = curr_rank;
+            if(curr_rank + 1 < displs.size())
+            {
+                if(i >= displs[curr_rank + 1] - 1)
+                {
+                    curr_rank++;
+                }
+            }
+        }
+
+        for(int i=0;i<retval.epart.size();i++)
+        {
+            retval.epart[i] = el_id_to_rank[i];
+        }
+    }
+
     return retval;
 }
 
@@ -309,29 +490,6 @@ void determineNodeOwnership(detail::MetisOutput& output, detail::MetisInput& inp
                 npart[n_id] = elem_owner;
             }
         }
-    }
-}
-
-void gatherMetisOutput(MpiComm& comm, detail::MetisOutput& output, int rank_0_offset)
-{
-    int rank = comm.getRank();
-    int comm_size = comm.getSize();
-
-    if(rank == 0)
-    {
-        std::span s(output.epart);
-
-        int offset = rank_0_offset;
-        for(int i=1;i<comm_size;i++)
-        {
-            int size = comm.probe(i, 0).numElems<int>();
-            comm.receive(s.subspan(offset, size), i, 0);
-            offset += size;
-        }
-    }
-    else
-    {
-        comm.send(output.epart, 0, 0);
     }
 }
 
@@ -449,8 +607,6 @@ auto partitionCondensedMesh(const MeshPartition< orders... >& mesh,
     MetisInput input = prepMetisInput(mesh, domain_data, forward_map, domain_ids, elem_centers);
     distributeMetisInput(comm, input, elem_centers);
     auto retval = invokeParallelMetisPartitioner(input, comm, mesh.getNNodes(), elem_centers);
-    int n_elems_per_core = (input.e_ptr.size() - 1)/comm.getSize();
-    gatherMetisOutput(comm, retval, n_elems_per_core);
     idx_t n_els = domain_data.n_elements;
     idx_t n_els_per_core = n_els/comm.getSize();
     determineNodeOwnership(retval, input);
@@ -726,7 +882,6 @@ auto participateInMetisCall(MpiComm& comm, const MeshPartition< orders... >& emp
     std::vector<real_t> elem_centers;
     detail::distributeMetisInput(comm, input, elem_centers);
     auto retval = invokeParallelMetisPartitioner(input, comm, 0, elem_centers);
-    detail::gatherMetisOutput(comm, retval, 0);
 
     return util::ArrayOwner< MeshPartition< orders... > >{};
 }
