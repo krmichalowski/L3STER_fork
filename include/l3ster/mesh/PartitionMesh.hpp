@@ -333,13 +333,8 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
 
         std::vector<idx_t> free_vert_ind(comm_size);
         std::vector<idx_t> free_edge_ind(comm_size);
-        free_vert_ind[0] = 0;
-        free_edge_ind[0] = 0;
-        for(int i=1;i<comm_size;i++)
-        {
-            free_vert_ind[i] = free_vert_ind[i - 1] + n_verts_for_rank[i - 1];
-            free_edge_ind[i] = free_edge_ind[i - 1] + n_edges_for_rank[i - 1];
-        }
+        std::exclusive_scan(n_verts_for_rank.begin(), n_verts_for_rank.end(), free_vert_ind.begin(), 0);
+        std::exclusive_scan(n_edges_for_rank.begin(), n_edges_for_rank.end(), free_edge_ind.begin(), 0);
 
         for(int i=0;i<n_local_verts_old;i++)
         {
@@ -357,18 +352,12 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         std::vector<int> send_displs_edges(comm_size);
         std::vector<int> recv_displs_verts(comm_size);
         std::vector<int> recv_displs_edges(comm_size);
-        send_displs_verts[0] = 0;
-        send_displs_edges[0] = 0;
-        recv_displs_verts[0] = 0;
-        recv_displs_edges[0] = 0;
-        for(int i=1;i<comm_size;i++)
-        {
-            send_displs_verts[i] = send_displs_verts[i - 1] + n_verts_for_rank[i - 1];
-            send_displs_edges[i] = send_displs_edges[i - 1] + n_edges_for_rank[i - 1];
 
-            recv_displs_verts[i] = recv_displs_verts[i - 1] + n_verts_from_rank[i - 1];
-            recv_displs_edges[i] = recv_displs_edges[i - 1] + n_edges_from_rank[i - 1];
-        }
+        std::exclusive_scan(n_verts_for_rank.begin(), n_verts_for_rank.end(), send_displs_verts.begin(), 0);
+        std::exclusive_scan(n_edges_for_rank.begin(), n_edges_for_rank.end(), send_displs_edges.begin(), 0);
+        
+        std::exclusive_scan(n_verts_from_rank.begin(), n_verts_from_rank.end(), recv_displs_verts.begin(), 0);
+        std::exclusive_scan(n_edges_from_rank.begin(), n_edges_from_rank.end(), recv_displs_edges.begin(), 0);
 
         for(int i=0;i<comm_size;i++)
         {
@@ -392,12 +381,12 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         verts_ids = std::move(new_verts_ids);
         n_edges = std::move(new_n_edges);
         part.resize(n_local_verts);
+
+        std::exclusive_scan(n_edges.begin(), n_edges.end(), xadj, 0);
+        xadj[n_local_verts] = xadj[n_local_verts - 1] + n_edges[n_local_verts - 1];
     };
 
     update_dist_graph(xadj, adjncy, comm_size, comm);
-
-    delete[] adjncy;
-    delete[] xadj;
 
     std::vector<idx_t> n_elem_ids_from_rank;
     if(rank == 0)
@@ -410,11 +399,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     std::vector<idx_t> displs(comm_size);
     if(rank == 0)
     {
-        displs[0] = 0;
-        for(int i=1;i<comm_size;i++)
-        {
-            displs[i] = displs[i - 1] + n_elem_ids_from_rank[i - 1];
-        }
+        std::exclusive_scan(n_elem_ids_from_rank.begin(), n_elem_ids_from_rank.end(), displs.begin(), 0);
     }
 
     MPI_Gatherv(verts_ids.data(), n_local_verts, MPI_INT, retval.epart.data(), n_elem_ids_from_rank.data(),
@@ -441,6 +426,9 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
             retval.epart[i] = el_id_to_rank[i];
         }
     }
+
+    delete[] adjncy;
+    delete[] xadj;
 
     return retval;
 }
