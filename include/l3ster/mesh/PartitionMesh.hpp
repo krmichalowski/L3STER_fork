@@ -211,7 +211,6 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
     int comm_size = comm.getSize();
 
     auto& [e_ind, e_ptr, e_dist] = metis_input;
-    auto  metis_options = makeMetisOptionsForPartitioning();
 
     size_t epart_size = 0;
     size_t npart_size = 0;
@@ -269,6 +268,8 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         n_edges[local_id] = xadj[local_id + 1] - xadj[local_id];
     }
     
+    std::vector<idx_t> metis_options(3);
+    metis_options[0] = 0;
     const auto error_code = ParMETIS_V3_PartGeomKway(e_dist.data(),
                                                      xadj,
                                                      adjncy,
@@ -414,13 +415,39 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         xadj[n_local_verts] = xadj[n_local_verts - 1] + n_edges[n_local_verts - 1];
     };
 
-    std::cerr<<edgecut<<" "<<rank<<std::endl;
     update_dist_graph(xadj, adjncy, comm_size, comm);
-    ParMETIS_V3_RefineKway(e_dist.data(), xadj, adjncy, nullptr, nullptr, &wtgflag, &numflag, &ncon, &nparts,
-                           tpwgts.data(), ubvec.data(), metis_options.data(), &edgecut, part.data(), comm.getRef());
-    std::cerr<<edgecut<<" "<<rank<<std::endl;
-    //update_dist_graph(xadj, adjncy, comm_size, comm);
+    metis_options.resize(4);
+    metis_options[0] = 1;
+    metis_options[1] = 0;
+    metis_options[2] = 5;
+    metis_options[3] = PARMETIS_PSR_COUPLED;
 
+    bool optimize = true;
+    if(rank == 0)
+    {
+        std::cout<<"starting partition refinement, initial edges cut: "<<edgecut<<std::endl;
+    }
+    int counter = 1;
+    while(optimize)
+    {
+        idx_t last_edgecut = edgecut;
+        ParMETIS_V3_RefineKway(e_dist.data(), xadj, adjncy, nullptr, nullptr, &wtgflag, &numflag, &ncon, &nparts,
+                               tpwgts.data(), ubvec.data(), metis_options.data(), &edgecut, part.data(), comm.getRef());
+        update_dist_graph(xadj, adjncy, comm_size, comm);
+        if(rank == 0)
+        {
+            std::cout<<"after iteration: "<<counter<<", edges cut: "<<edgecut<<std::endl;
+        }
+        if(edgecut == last_edgecut)
+        {
+            optimize = false;
+            if(rank == 0)
+            {
+                std::cout<<"ending partition refinement"<<std::endl;
+            }
+        }
+        counter++;
+    }
 
     std::vector<idx_t> n_elem_ids_from_rank;
     if(rank == 0)
