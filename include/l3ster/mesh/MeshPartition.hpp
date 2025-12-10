@@ -127,7 +127,6 @@ public:
 
     // Observers
     inline auto getNElements() const -> size_t;
-    inline auto getNInternalElements() const -> size_t;
     auto        getNNodes() const -> size_t { return m_node_ownership->localSize(); }
     auto        getNDomains() const { return m_domains.size(); }
     auto        getDomainIds() const { return m_domains | std::views::keys; }
@@ -448,21 +447,6 @@ auto MeshPartition< orders... >::getNElements() const -> size_t
 {
     return std::transform_reduce(
         m_domains.cbegin(), m_domains.cend(), 0uz, std::plus{}, [](const auto& d) { return d.second.elements.size(); });
-}
-
-template < el_o_t... orders >
-auto MeshPartition< orders... >::getNInternalElements() const -> size_t
-{
-    size_t n_elems = 0;
-    for(const auto& d : m_domains)
-    {
-        if(!(m_boundary_manager.contains(d.first)))
-        {
-            n_elems += d.second.elements.size();
-        }
-    }
-
-    return n_elems;
 }
 
 template < el_o_t... orders >
