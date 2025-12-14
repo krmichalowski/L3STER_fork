@@ -467,11 +467,13 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         ParMETIS_V3_RefineKway(e_dist.data(), xadj, adjncy, nullptr, nullptr, &wtgflag, &numflag, &ncon, &nparts,
                                tpwgts.data(), ubvec.data(), metis_options.data(), &edgecut, part.data(), comm.getRef());
         update_dist_graph(xadj, adjncy, comm_size, comm);
+        double improvement = (double)(last_edgecut - edgecut)/last_edgecut;
         if(rank == 0)
         {
-            std::cout<<"after iteration: "<<counter<<", edges cut: "<<edgecut<<std::endl;
+            std::cout<<"after iteration: "<<counter<<", edges cut: "<<edgecut;
+            std::cout<<", improvement: "<<100 * improvement <<"%"<<std::endl;
         }
-        if((last_edgecut - edgecut)/last_edgecut <= 0.005)
+        if(improvement <= 0.001)
         {
             optimize = false;
             if(rank == 0)
