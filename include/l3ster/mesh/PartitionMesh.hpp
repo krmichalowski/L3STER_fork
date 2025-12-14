@@ -377,20 +377,48 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         std::exclusive_scan(n_verts_from_rank.begin(), n_verts_from_rank.end(), recv_displs_verts.begin(), 0);
         std::exclusive_scan(n_edges_from_rank.begin(), n_edges_from_rank.end(), recv_displs_edges.begin(), 0);
 
+        std::vector<std::vector<MPI_Request>> send_requests(4);
+        std::vector<std::vector<MPI_Request>> recv_requests(4);
+        for(int i=0;i<4;i++)
+        {
+            send_requests[i].resize(comm_size);
+            recv_requests[i].resize(comm_size);
+            for(int j=0;j<comm_size;j++)
+            {
+                send_requests[i][j] = MPI_REQUEST_NULL;
+                recv_requests[i][j] = MPI_REQUEST_NULL;
+            }
+        }
         for(int i=0;i<comm_size;i++)
         {
-            MPI_Scatterv(send_vert_ids.data(), n_verts_for_rank.data(), send_displs_verts.data(), MPI_INT,
-                         (void*)(new_verts_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i],
-                         MPI_INT, i, comm.get());
-            MPI_Scatterv(send_vert_current_ids.data(), n_verts_for_rank.data(), send_displs_verts.data(), MPI_INT,
-                         (void*)(local_current_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i],
-                         MPI_INT, i, comm.get());
-            MPI_Scatterv(send_n_edges.data(), n_verts_for_rank.data(), send_displs_verts.data(), MPI_INT,
-                         (void*)(new_n_edges.data() + recv_displs_verts[i]), n_verts_from_rank[i],
-                         MPI_INT, i, comm.get());
-            MPI_Scatterv(send_edges.data(), n_edges_for_rank.data(), send_displs_edges.data(), MPI_INT,
-                         (void*)(new_adjncy + recv_displs_edges[i]), n_edges_from_rank[i],
-                         MPI_INT, i, comm.get());
+            if(n_verts_for_rank[i] > 0)
+            {
+                MPI_Isend((void*)(send_vert_ids.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
+                          i, 0, comm.get(), &send_requests[0][i]);
+                MPI_Isend((void*)(send_vert_current_ids.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
+                          i, 1, comm.get(), &send_requests[1][i]);
+                MPI_Isend((void*)(send_n_edges.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
+                          i, 2, comm.get(), &send_requests[2][i]);
+                MPI_Isend((void*)(send_edges.data() + send_displs_edges[i]), n_edges_for_rank[i], MPI_INT,
+                          i, 3, comm.get(), &send_requests[3][i]);
+            }
+            if(n_verts_from_rank[i] > 0)
+            {
+                MPI_Irecv((void*)(new_verts_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
+                          i, 0, comm.get(), &recv_requests[0][i]);
+                MPI_Irecv((void*)(local_current_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
+                          i, 1, comm.get(), &recv_requests[1][i]);
+                MPI_Irecv((void*)(new_n_edges.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
+                          i, 2, comm.get(), &recv_requests[2][i]);
+                MPI_Irecv((void*)(new_adjncy + recv_displs_edges[i]), n_edges_from_rank[i], MPI_INT,
+                          i, 3, comm.get(), &recv_requests[3][i]);
+            }
+        }
+
+        for(int i=0;i<4;i++)
+        {
+            MPI_Waitall(comm_size, send_requests[i].data(), MPI_STATUSES_IGNORE);
+            MPI_Waitall(comm_size, recv_requests[i].data(), MPI_STATUSES_IGNORE);
         }
 
         MPI_Allgatherv(local_current_ids.data(), n_verts_per_rank[rank], MPI_INT, all_current_ids.data(),
@@ -443,7 +471,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         {
             std::cout<<"after iteration: "<<counter<<", edges cut: "<<edgecut<<std::endl;
         }
-        if(edgecut == last_edgecut)
+        if((last_edgecut - edgecut)/last_edgecut <= 0.005)
         {
             optimize = false;
             if(rank == 0)
