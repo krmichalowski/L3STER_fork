@@ -289,22 +289,184 @@ void redistributeGraphData(std::vector<std::vector<idx_t>>& svi, std::vector<std
 
 void renumberVertsAndFreeOldData(std::vector<idx_t>& local_current_ids, std::vector<idx_t>& all_current_ids, idx_t n_local_edges,
                                  std::vector<idx_t>& e_dist, MpiComm& comm, idx_t* new_adjncy, idx_t* xadj, idx_t* adjncy,
-                                 std::vector<idx_t>& n_verts_per_rank)
+                                 std::vector<idx_t>& n_verts_per_rank, std::vector<idx_t>& old_e_dist, std::vector<idx_t>& part)
 {
     int rank = comm.getRank();
     int comm_size = comm.getSize();
 
-    MPI_Allgatherv(local_current_ids.data(), n_verts_per_rank[rank], MPI_INT, all_current_ids.data(),
-                   n_verts_per_rank.data(), e_dist.data(), MPI_INT, comm.get());
-        
-    std::unordered_map<idx_t, idx_t> old_to_new_ids(all_current_ids.size());
-    for(int i=0;i<all_current_ids.size();i++)
+    std::unordered_map<idx_t, idx_t> local_old_to_new_id(local_current_ids.size());
+    for(int i=0;i<local_current_ids.size();i++)
     {
-        old_to_new_ids[all_current_ids[i]] = i;
+        local_old_to_new_id[local_current_ids[i]] = i + e_dist[rank];
     }
+
+    std::vector<std::vector<idx_t>> unknown_ids(comm_size);
+    std::vector<std::vector<idx_t>> new_owners(comm_size);
     for(int i=0;i<n_local_edges;i++)
     {
-        new_adjncy[i] = old_to_new_ids[new_adjncy[i]];
+        idx_t id = new_adjncy[i];
+        if(!local_old_to_new_id.contains(id))
+        {
+            for(int j=0;j<comm_size;j++)
+            {
+                if(id >= old_e_dist[j] && id < old_e_dist[j + 1])
+                {
+                    unknown_ids[j].push_back(id);
+                }
+            }
+        }
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        new_owners[i].resize(unknown_ids[i].size());
+    }
+
+    std::vector<idx_t> n_unknown_ids_for(comm_size);
+    std::vector<idx_t> n_unknown_ids_from(comm_size);
+    for(int i=0;i<comm_size;i++)
+    {
+        n_unknown_ids_for[i] = unknown_ids[i].size();
+    }
+
+    std::vector<std::vector<idx_t>> recv_ids_from(comm_size);
+    for(int i=0;i<comm_size;i++)
+    {
+        MPI_Scatter(n_unknown_ids_for.data(), 1, MPI_INT, &n_unknown_ids_from[i], 1, MPI_INT, i, comm.get());
+        recv_ids_from[i].resize(n_unknown_ids_from[i]);
+    }
+    
+    std::vector<MPI_Request> send_reqs(comm_size);
+    std::vector<MPI_Request> recv_reqs(comm_size);
+    for(int i=0;i<comm_size;i++)
+    {
+        send_reqs[i] = MPI_REQUEST_NULL;
+        recv_reqs[i] = MPI_REQUEST_NULL;
+    }
+
+    for(int i=0;i<comm_size;i++)
+    {
+        if(n_unknown_ids_for[i] > 0)
+        {
+            MPI_Isend(unknown_ids[i].data(), n_unknown_ids_for[i], MPI_INT, i, 0, comm.get(), &send_reqs[i]);
+        }
+
+        if(n_unknown_ids_from[i] > 0)
+        {
+            MPI_Irecv(recv_ids_from[i].data(), n_unknown_ids_from[i], MPI_INT, i, 0, comm.get(), &recv_reqs[i]);
+        }
+    }
+    MPI_Waitall(comm_size, send_reqs.data(), MPI_STATUSES_IGNORE);
+    MPI_Waitall(comm_size, recv_reqs.data(), MPI_STATUSES_IGNORE);
+
+    //na tym etapie kazdy ma w swojej tablicy recv_ids_from id wezlow ktorych wczesniej byl wlasciielem,
+    //musi kazdemu odeslac na new_owners kto jest ich nowym wlascicielem, bierze to ze swojej tablicy part
+    //nadpisze recv_ids_from i odesle
+    for(int i=0;i<comm_size;i++)
+    {
+        send_reqs[i] = MPI_REQUEST_NULL;
+        recv_reqs[i] = MPI_REQUEST_NULL;
+    }
+
+    for(int i=0;i<comm_size;i++)
+    {
+        if(n_unknown_ids_from[i] > 0)
+        {
+            for(int j=0;j<recv_ids_from[i].size();j++)
+            {
+                recv_ids_from[i][j] = part[recv_ids_from[i][j] - old_e_dist[rank]];
+            }
+
+            MPI_Isend(recv_ids_from[i].data(), n_unknown_ids_from[i], MPI_INT, i, 0, comm.get(), &send_reqs[i]);
+        }
+
+        if(n_unknown_ids_for[i] > 0)
+        {
+            MPI_Irecv(new_owners[i].data(), n_unknown_ids_for[i], MPI_INT, i, 0, comm.get(), &recv_reqs[i]);
+        }
+    }
+    MPI_Waitall(comm_size, send_reqs.data(), MPI_STATUSES_IGNORE);
+    MPI_Waitall(comm_size, recv_reqs.data(), MPI_STATUSES_IGNORE);
+
+    //na tym etapie kazdy ma juz wlascicieli swoich unknown nodes teraz trzeba wyslac zapytanie o nowe id
+    std::vector<std::vector<idx_t>> unknown_ids_final(comm_size);
+    std::vector<std::vector<idx_t>> new_ids(comm_size);
+    for(int i=0;i<comm_size;i++)
+    {
+        for(int j=0;j<unknown_ids[i].size();j++)
+        {
+            unknown_ids_final[new_owners[i][j]].push_back(unknown_ids[i][j]);
+        }
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        new_ids[i].resize(unknown_ids_final[i].size());
+        n_unknown_ids_for[i] = unknown_ids_final[i].size();
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        MPI_Scatter(n_unknown_ids_for.data(), 1, MPI_INT, &n_unknown_ids_from[i], 1, MPI_INT, i, comm.get());
+        recv_ids_from[i].resize(n_unknown_ids_from[i]);
+    }
+
+    for(int i=0;i<comm_size;i++)
+    {
+        send_reqs[i] = MPI_REQUEST_NULL;
+        recv_reqs[i] = MPI_REQUEST_NULL;
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        if(n_unknown_ids_for[i] > 0)
+        {
+            MPI_Isend(unknown_ids_final[i].data(), n_unknown_ids_for[i], MPI_INT, i, 0, comm.get(), &send_reqs[i]);
+        }
+
+        if(n_unknown_ids_from[i] > 0)
+        {
+            MPI_Irecv(recv_ids_from[i].data(), n_unknown_ids_from[i], MPI_INT, i, 0, comm.get(), &recv_reqs[i]);
+        }
+    }
+    MPI_Waitall(comm_size, send_reqs.data(), MPI_STATUSES_IGNORE);
+    MPI_Waitall(comm_size, recv_reqs.data(), MPI_STATUSES_IGNORE);
+
+
+    //na tym etapie, kazdy ma w recv ids id ktore powinny byc u niego w mapie i musi odeslac do czego one mapuja
+    for(int i=0;i<comm_size;i++)
+    {
+        send_reqs[i] = MPI_REQUEST_NULL;
+        recv_reqs[i] = MPI_REQUEST_NULL;
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        if(n_unknown_ids_from[i] > 0)
+        {
+            for(int j=0;j<recv_ids_from[i].size();j++)
+            {
+                recv_ids_from[i][j] = local_old_to_new_id[recv_ids_from[i][j]];
+            }
+
+            MPI_Isend(recv_ids_from[i].data(), n_unknown_ids_from[i], MPI_INT, i, 0, comm.get(), &send_reqs[i]);
+        }
+
+        if(n_unknown_ids_for[i] > 0)
+        {
+            MPI_Irecv(new_ids[i].data(), n_unknown_ids_for[i], MPI_INT, i, 0, comm.get(), &recv_reqs[i]);
+        }
+    }
+    MPI_Waitall(comm_size, send_reqs.data(), MPI_STATUSES_IGNORE);
+    MPI_Waitall(comm_size, recv_reqs.data(), MPI_STATUSES_IGNORE);
+
+    //teraz dodajemy do mapy brakujace id
+    for(int i=0;i<comm_size;i++)
+    {
+        for(int j=0;j<new_ids[i].size();j++)
+        {
+            local_old_to_new_id[unknown_ids_final[i][j]] = new_ids[i][j];
+        }
+    }
+
+    for(int i=0;i<n_local_edges;i++)
+    {
+        new_adjncy[i] = local_old_to_new_id[new_adjncy[i]];
     }
 
     delete[] xadj;
@@ -456,6 +618,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         idx_t nlv = n_local_verts;
         std::vector<idx_t> n_verts_per_rank(comm_size);
         MPI_Allgather(&nlv, 1, MPI_INT, n_verts_per_rank.data(), 1, MPI_INT, comm.get());
+        std::vector<idx_t> old_e_dist = e_dist;
         std::exclusive_scan(n_verts_per_rank.begin(), n_verts_per_rank.end(), e_dist.begin(), 0);
         e_dist[comm_size] = e_dist[comm_size - 1] + n_verts_per_rank[comm_size - 1];
         idx_t n_elems_total = std::reduce(n_verts_per_rank.begin(), n_verts_per_rank.end());
@@ -468,7 +631,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
                               local_current_ids, new_n_edges);
 
         renumberVertsAndFreeOldData(local_current_ids, all_current_ids, n_local_edges, e_dist, comm, new_adjncy,
-                                    xadj, adjncy, n_verts_per_rank);
+                                    xadj, adjncy, n_verts_per_rank, old_e_dist, part);
 
         xadj = new_xadj;
         adjncy = new_adjncy;
