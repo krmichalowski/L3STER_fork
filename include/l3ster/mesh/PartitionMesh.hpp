@@ -234,6 +234,115 @@ void calcAndDistSizes(std::vector<idx_t>& nv_for, std::vector<idx_t>& nv_from, s
     }
 }
 
+void redistributeGraphData(std::vector<std::vector<idx_t>>& svi, std::vector<std::vector<idx_t>>& svci, std::vector<std::vector<idx_t>>& sne,
+                           std::vector<std::vector<idx_t>>& se, std::vector<idx_t>& nv_for, std::vector<idx_t>& nv_from, std::vector<idx_t>& ne_for,
+                           std::vector<idx_t>& ne_from, MpiComm& comm, idx_t* new_adjncy, std::vector<idx_t>& new_verts_ids,
+                           std::vector<idx_t>& local_current_ids, std::vector<idx_t>& new_n_edges)
+{
+    int comm_size = comm.getSize();
+    std::vector<int> recv_displs_verts(comm_size);
+    std::vector<int> recv_displs_edges(comm_size);
+    
+    std::exclusive_scan(nv_from.begin(), nv_from.end(), recv_displs_verts.begin(), 0);
+    std::exclusive_scan(ne_from.begin(), ne_from.end(), recv_displs_edges.begin(), 0);
+
+    std::vector<std::vector<MPI_Request>> send_requests(4);
+    std::vector<std::vector<MPI_Request>> recv_requests(4);
+    for(int i=0;i<4;i++)
+    {
+        send_requests[i].resize(comm_size);
+        recv_requests[i].resize(comm_size);
+        for(int j=0;j<comm_size;j++)
+        {
+            send_requests[i][j] = MPI_REQUEST_NULL;
+            recv_requests[i][j] = MPI_REQUEST_NULL;
+        }
+    }
+    for(int i=0;i<comm_size;i++)
+    {
+        if(nv_for[i] > 0)
+        {
+            MPI_Isend(svi[i].data(), nv_for[i], MPI_INT, i, 0, comm.get(), &send_requests[0][i]);
+            MPI_Isend(svci[i].data(), nv_for[i], MPI_INT, i, 1, comm.get(), &send_requests[1][i]);
+            MPI_Isend(sne[i].data(), nv_for[i], MPI_INT, i, 2, comm.get(), &send_requests[2][i]);
+            MPI_Isend(se[i].data(), ne_for[i], MPI_INT, i, 3, comm.get(), &send_requests[3][i]);
+        }
+        if(nv_from[i] > 0)
+        {
+            MPI_Irecv((void*)(new_verts_ids.data() + recv_displs_verts[i]), nv_from[i], MPI_INT,
+                        i, 0, comm.get(), &recv_requests[0][i]);
+            MPI_Irecv((void*)(local_current_ids.data() + recv_displs_verts[i]), nv_from[i], MPI_INT,
+                        i, 1, comm.get(), &recv_requests[1][i]);
+            MPI_Irecv((void*)(new_n_edges.data() + recv_displs_verts[i]), nv_from[i], MPI_INT,
+                        i, 2, comm.get(), &recv_requests[2][i]);
+            MPI_Irecv((void*)(new_adjncy + recv_displs_edges[i]), ne_from[i], MPI_INT,
+                        i, 3, comm.get(), &recv_requests[3][i]);
+        }
+    }
+
+    for(int i=0;i<4;i++)
+    {
+        MPI_Waitall(comm_size, send_requests[i].data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(comm_size, recv_requests[i].data(), MPI_STATUSES_IGNORE);
+    }
+}
+
+void renumberVertsAndFreeOldData(std::vector<idx_t>& local_current_ids, std::vector<idx_t>& all_current_ids, idx_t n_local_edges,
+                                 std::vector<idx_t>& e_dist, MpiComm& comm, idx_t* new_adjncy, idx_t* xadj, idx_t* adjncy,
+                                 std::vector<idx_t>& n_verts_per_rank)
+{
+    int rank = comm.getRank();
+    int comm_size = comm.getSize();
+
+    MPI_Allgatherv(local_current_ids.data(), n_verts_per_rank[rank], MPI_INT, all_current_ids.data(),
+                   n_verts_per_rank.data(), e_dist.data(), MPI_INT, comm.get());
+        
+    std::unordered_map<idx_t, idx_t> old_to_new_ids(all_current_ids.size());
+    for(int i=0;i<all_current_ids.size();i++)
+    {
+        old_to_new_ids[all_current_ids[i]] = i;
+    }
+    for(int i=0;i<n_local_edges;i++)
+    {
+        new_adjncy[i] = old_to_new_ids[new_adjncy[i]];
+    }
+
+    delete[] xadj;
+    delete[] adjncy;
+}
+
+void prepSendData(std::vector<std::vector<idx_t>>& svi, std::vector<std::vector<idx_t>>& se, std::vector<std::vector<idx_t>>& sne,
+                  std::vector<std::vector<idx_t>>& svci, std::vector<idx_t>& part, std::vector<idx_t>& verts_ids,
+                  std::vector<idx_t>& e_dist, idx_t* adjncy, idx_t* xadj, MpiComm& comm, std::vector<idx_t>& nv_for,
+                  std::vector<idx_t>& ne_for, std::vector<idx_t>& n_edges, int n_local_verts_old)
+{
+    int rank = comm.getRank();
+    int comm_size = comm.getSize();
+    svi.resize(comm_size);
+    se.resize(comm_size);
+    sne.resize(comm_size);
+    svci.resize(comm_size);
+    for(int i=0;i<comm_size;i++)
+    {
+        svi[i].reserve(nv_for[i]);
+        se[i].reserve(ne_for[i]);
+        sne[i].reserve(nv_for[i]);
+        svci[i].reserve(nv_for[i]);
+    }
+
+    for(int i=0;i<n_local_verts_old;i++)
+    {
+        int owner = part[i];
+        svi[owner].push_back(verts_ids[i]);
+        sne[owner].push_back(n_edges[i]);
+        svci[owner].push_back(i + e_dist[rank]);
+        for(int j=xadj[i];j<xadj[i + 1];j++)
+        {
+            se[owner].push_back(adjncy[j]);
+        }
+    }
+}
+
 inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes, std::vector<real_t>& elem_centers, dim_t domain_dim)
 {
     int rank = comm.getRank();
@@ -320,9 +429,10 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
    
     auto update_dist_graph = [&part, &verts_ids, &n_edges, &n_local_verts, &n_local_edges, &e_dist](idx_t*& xadj,
                                                                                                     idx_t*& adjncy,
-                                                                                                    int comm_size,
                                                                                                     MpiComm& comm)
     {
+        int rank = comm.getRank();
+        int comm_size = comm.getSize();
         std::vector<idx_t> n_verts_for_rank, n_verts_from_rank;
         std::vector<idx_t> n_edges_for_rank, n_edges_from_rank;
         calcAndDistSizes(n_verts_for_rank, n_verts_from_rank, n_edges_for_rank, n_edges_from_rank,
@@ -340,30 +450,8 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         new_n_edges.resize(n_local_verts);
 
         std::vector<std::vector<idx_t>> send_vert_ids, send_edges, send_n_edges, send_vert_current_ids;
-        send_vert_ids.resize(comm_size);
-        send_edges.resize(comm_size);
-        send_n_edges.resize(comm_size);
-        send_vert_current_ids.resize(comm_size);
-        for(int i=0;i<comm_size;i++)
-        {
-            send_vert_ids[i].reserve(n_verts_for_rank[i]);
-            send_edges[i].reserve(n_edges_for_rank[i]);
-            send_n_edges[i].reserve(n_verts_for_rank[i]);
-            send_vert_current_ids[i].reserve(n_verts_for_rank[i]);
-        }
-
-        int rank = comm.getRank();
-        for(int i=0;i<n_local_verts_old;i++)
-        {
-            int owner = part[i];
-            send_vert_ids[owner].push_back(verts_ids[i]);
-            send_n_edges[owner].push_back(n_edges[i]);
-            send_vert_current_ids[owner].push_back(i + e_dist[rank]);
-            for(int j=xadj[i];j<xadj[i + 1];j++)
-            {
-                send_edges[owner].push_back(adjncy[j]);
-            }
-        }
+        prepSendData(send_vert_ids, send_edges, send_n_edges, send_vert_current_ids, part, verts_ids, e_dist,
+                     adjncy, xadj, comm, n_verts_for_rank, n_edges_for_rank, n_edges, n_local_verts_old);
 
         idx_t nlv = n_local_verts;
         std::vector<idx_t> n_verts_per_rank(comm_size);
@@ -375,67 +463,12 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         std::vector<idx_t> all_current_ids(n_elems_total);
         std::vector<idx_t> local_current_ids(n_verts_per_rank[rank]);
 
-        std::vector<int> recv_displs_verts(comm_size);
-        std::vector<int> recv_displs_edges(comm_size);
-        
-        std::exclusive_scan(n_verts_from_rank.begin(), n_verts_from_rank.end(), recv_displs_verts.begin(), 0);
-        std::exclusive_scan(n_edges_from_rank.begin(), n_edges_from_rank.end(), recv_displs_edges.begin(), 0);
+        redistributeGraphData(send_vert_ids, send_vert_current_ids, send_n_edges, send_edges, n_verts_for_rank,
+                              n_verts_from_rank, n_edges_for_rank, n_edges_from_rank, comm, new_adjncy, new_verts_ids,
+                              local_current_ids, new_n_edges);
 
-        std::vector<std::vector<MPI_Request>> send_requests(4);
-        std::vector<std::vector<MPI_Request>> recv_requests(4);
-        for(int i=0;i<4;i++)
-        {
-            send_requests[i].resize(comm_size);
-            recv_requests[i].resize(comm_size);
-            for(int j=0;j<comm_size;j++)
-            {
-                send_requests[i][j] = MPI_REQUEST_NULL;
-                recv_requests[i][j] = MPI_REQUEST_NULL;
-            }
-        }
-        for(int i=0;i<comm_size;i++)
-        {
-            if(n_verts_for_rank[i] > 0)
-            {
-                MPI_Isend(send_vert_ids[i].data(), n_verts_for_rank[i], MPI_INT, i, 0, comm.get(), &send_requests[0][i]);
-                MPI_Isend(send_vert_current_ids[i].data(), n_verts_for_rank[i], MPI_INT, i, 1, comm.get(), &send_requests[1][i]);
-                MPI_Isend(send_n_edges[i].data(), n_verts_for_rank[i], MPI_INT, i, 2, comm.get(), &send_requests[2][i]);
-                MPI_Isend(send_edges[i].data(), n_edges_for_rank[i], MPI_INT, i, 3, comm.get(), &send_requests[3][i]);
-            }
-            if(n_verts_from_rank[i] > 0)
-            {
-                MPI_Irecv((void*)(new_verts_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
-                          i, 0, comm.get(), &recv_requests[0][i]);
-                MPI_Irecv((void*)(local_current_ids.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
-                          i, 1, comm.get(), &recv_requests[1][i]);
-                MPI_Irecv((void*)(new_n_edges.data() + recv_displs_verts[i]), n_verts_from_rank[i], MPI_INT,
-                          i, 2, comm.get(), &recv_requests[2][i]);
-                MPI_Irecv((void*)(new_adjncy + recv_displs_edges[i]), n_edges_from_rank[i], MPI_INT,
-                          i, 3, comm.get(), &recv_requests[3][i]);
-            }
-        }
-
-        for(int i=0;i<4;i++)
-        {
-            MPI_Waitall(comm_size, send_requests[i].data(), MPI_STATUSES_IGNORE);
-            MPI_Waitall(comm_size, recv_requests[i].data(), MPI_STATUSES_IGNORE);
-        }
-
-        MPI_Allgatherv(local_current_ids.data(), n_verts_per_rank[rank], MPI_INT, all_current_ids.data(),
-                       n_verts_per_rank.data(), e_dist.data(), MPI_INT, comm.get());
-        
-        std::unordered_map<idx_t, idx_t> old_to_new_ids(all_current_ids.size());
-        for(int i=0;i<all_current_ids.size();i++)
-        {
-            old_to_new_ids[all_current_ids[i]] = i;
-        }
-        for(int i=0;i<n_local_edges;i++)
-        {
-            new_adjncy[i] = old_to_new_ids[new_adjncy[i]];
-        }
-
-        delete[] xadj;
-        delete[] adjncy;
+        renumberVertsAndFreeOldData(local_current_ids, all_current_ids, n_local_edges, e_dist, comm, new_adjncy,
+                                    xadj, adjncy, n_verts_per_rank);
 
         xadj = new_xadj;
         adjncy = new_adjncy;
@@ -448,7 +481,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         xadj[n_local_verts] = xadj[n_local_verts - 1] + n_edges[n_local_verts - 1];
     };
 
-    update_dist_graph(xadj, adjncy, comm_size, comm);
+    update_dist_graph(xadj, adjncy, comm);
     metis_options.resize(4);
     metis_options[0] = 1;
     metis_options[1] = 0;
@@ -466,7 +499,7 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         idx_t last_edgecut = edgecut;
         ParMETIS_V3_RefineKway(e_dist.data(), xadj, adjncy, nullptr, nullptr, &wtgflag, &numflag, &ncon, &nparts,
                                tpwgts.data(), ubvec.data(), metis_options.data(), &edgecut, part.data(), comm.getRef());
-        update_dist_graph(xadj, adjncy, comm_size, comm);
+        update_dist_graph(xadj, adjncy, comm);
         double improvement = (double)(last_edgecut - edgecut)/last_edgecut;
         if(rank == 0)
         {
