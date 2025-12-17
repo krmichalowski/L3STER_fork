@@ -210,6 +210,30 @@ inline auto invokeMetisPartitioner(idx_t                      n_els,
     return retval;
 }
 
+void calcAndDistSizes(std::vector<idx_t>& nv_for, std::vector<idx_t>& nv_from, std::vector<idx_t>& ne_for, std::vector<idx_t>& ne_from,
+                      MpiComm& comm, std::vector<idx_t>& part, idx_t* xadj, size_t n_local_verts)
+{
+    int comm_size = comm.getSize();
+    nv_for.resize(comm_size);
+    nv_from.resize(comm_size);
+    ne_for.resize(comm_size);
+    ne_from.resize(comm_size);
+
+    for(int i=0;i<n_local_verts;i++)
+    {
+        int owner = part[i];
+        nv_for[owner]++;
+        ne_for[owner] += xadj[i + 1] - xadj[i];
+    }
+
+    for(int i=0;i<comm_size;i++)
+    {
+        //brakuje scattera we wraperze
+        MPI_Scatter(nv_for.data(), 1, MPI_INT, &nv_from[i], 1, MPI_INT, i, comm.get());
+        MPI_Scatter(ne_for.data(), 1, MPI_INT, &ne_from[i], 1, MPI_INT, i, comm.get());
+    }
+}
+
 inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& comm, int n_nodes, std::vector<real_t>& elem_centers, dim_t domain_dim)
 {
     int rank = comm.getRank();
@@ -299,24 +323,10 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
                                                                                                     int comm_size,
                                                                                                     MpiComm& comm)
     {
-        std::vector<idx_t> n_verts_for_rank(comm_size, 0);
-        std::vector<idx_t> n_edges_for_rank(comm_size, 0);
-
-        std::vector<idx_t> n_verts_from_rank(comm_size, 0);
-        std::vector<idx_t> n_edges_from_rank(comm_size, 0);
-
-        for(int i=0;i<n_local_verts;i++)
-        {
-            int owner = part[i];
-            n_verts_for_rank[owner]++;
-            n_edges_for_rank[owner] += xadj[i + 1] - xadj[i];
-        }
-
-        for(int i=0;i<comm_size;i++)
-        {
-            MPI_Scatter(n_verts_for_rank.data(), 1, MPI_INT, &n_verts_from_rank[i], 1, MPI_INT, i, comm.get());
-            MPI_Scatter(n_edges_for_rank.data(), 1, MPI_INT, &n_edges_from_rank[i], 1, MPI_INT, i, comm.get());
-        }
+        std::vector<idx_t> n_verts_for_rank, n_verts_from_rank;
+        std::vector<idx_t> n_edges_for_rank, n_edges_from_rank;
+        calcAndDistSizes(n_verts_for_rank, n_verts_from_rank, n_edges_for_rank, n_edges_from_rank,
+                         comm, part, xadj, n_local_verts);
 
         int n_local_edges_old = n_local_edges;
         int n_local_verts_old = n_local_verts;
@@ -329,30 +339,29 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         new_verts_ids.resize(n_local_verts);
         new_n_edges.resize(n_local_verts);
 
-        std::vector<idx_t> send_vert_ids, send_edges, send_n_edges, send_vert_current_ids;
-        size_t vert_data_size = std::reduce(n_verts_for_rank.begin(), n_verts_for_rank.end());
-        size_t edge_data_size = std::reduce(n_edges_for_rank.begin(), n_edges_for_rank.end());
-        send_vert_ids.resize(vert_data_size);
-        send_edges.resize(edge_data_size);
-        send_n_edges.resize(vert_data_size);
-        send_vert_current_ids.resize(vert_data_size);
-
-        std::vector<idx_t> free_vert_ind(comm_size);
-        std::vector<idx_t> free_edge_ind(comm_size);
-        std::exclusive_scan(n_verts_for_rank.begin(), n_verts_for_rank.end(), free_vert_ind.begin(), 0);
-        std::exclusive_scan(n_edges_for_rank.begin(), n_edges_for_rank.end(), free_edge_ind.begin(), 0);
+        std::vector<std::vector<idx_t>> send_vert_ids, send_edges, send_n_edges, send_vert_current_ids;
+        send_vert_ids.resize(comm_size);
+        send_edges.resize(comm_size);
+        send_n_edges.resize(comm_size);
+        send_vert_current_ids.resize(comm_size);
+        for(int i=0;i<comm_size;i++)
+        {
+            send_vert_ids[i].reserve(n_verts_for_rank[i]);
+            send_edges[i].reserve(n_edges_for_rank[i]);
+            send_n_edges[i].reserve(n_verts_for_rank[i]);
+            send_vert_current_ids[i].reserve(n_verts_for_rank[i]);
+        }
 
         int rank = comm.getRank();
         for(int i=0;i<n_local_verts_old;i++)
         {
             int owner = part[i];
-
-            send_vert_ids[free_vert_ind[owner]] = verts_ids[i];
-            send_n_edges[free_vert_ind[owner]] = n_edges[i];
-            send_vert_current_ids[free_vert_ind[owner]++] = i + e_dist[rank];
+            send_vert_ids[owner].push_back(verts_ids[i]);
+            send_n_edges[owner].push_back(n_edges[i]);
+            send_vert_current_ids[owner].push_back(i + e_dist[rank]);
             for(int j=xadj[i];j<xadj[i + 1];j++)
             {
-                send_edges[free_edge_ind[owner]++] = adjncy[j];
+                send_edges[owner].push_back(adjncy[j]);
             }
         }
 
@@ -366,13 +375,8 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         std::vector<idx_t> all_current_ids(n_elems_total);
         std::vector<idx_t> local_current_ids(n_verts_per_rank[rank]);
 
-        std::vector<int> send_displs_verts(comm_size);
-        std::vector<int> send_displs_edges(comm_size);
         std::vector<int> recv_displs_verts(comm_size);
         std::vector<int> recv_displs_edges(comm_size);
-
-        std::exclusive_scan(n_verts_for_rank.begin(), n_verts_for_rank.end(), send_displs_verts.begin(), 0);
-        std::exclusive_scan(n_edges_for_rank.begin(), n_edges_for_rank.end(), send_displs_edges.begin(), 0);
         
         std::exclusive_scan(n_verts_from_rank.begin(), n_verts_from_rank.end(), recv_displs_verts.begin(), 0);
         std::exclusive_scan(n_edges_from_rank.begin(), n_edges_from_rank.end(), recv_displs_edges.begin(), 0);
@@ -393,14 +397,10 @@ inline auto invokeParallelMetisPartitioner(MetisInput& metis_input, MpiComm& com
         {
             if(n_verts_for_rank[i] > 0)
             {
-                MPI_Isend((void*)(send_vert_ids.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
-                          i, 0, comm.get(), &send_requests[0][i]);
-                MPI_Isend((void*)(send_vert_current_ids.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
-                          i, 1, comm.get(), &send_requests[1][i]);
-                MPI_Isend((void*)(send_n_edges.data() + send_displs_verts[i]), n_verts_for_rank[i], MPI_INT,
-                          i, 2, comm.get(), &send_requests[2][i]);
-                MPI_Isend((void*)(send_edges.data() + send_displs_edges[i]), n_edges_for_rank[i], MPI_INT,
-                          i, 3, comm.get(), &send_requests[3][i]);
+                MPI_Isend(send_vert_ids[i].data(), n_verts_for_rank[i], MPI_INT, i, 0, comm.get(), &send_requests[0][i]);
+                MPI_Isend(send_vert_current_ids[i].data(), n_verts_for_rank[i], MPI_INT, i, 1, comm.get(), &send_requests[1][i]);
+                MPI_Isend(send_n_edges[i].data(), n_verts_for_rank[i], MPI_INT, i, 2, comm.get(), &send_requests[2][i]);
+                MPI_Isend(send_edges[i].data(), n_edges_for_rank[i], MPI_INT, i, 3, comm.get(), &send_requests[3][i]);
             }
             if(n_verts_from_rank[i] > 0)
             {
