@@ -226,12 +226,8 @@ void calcAndDistSizes(std::vector<idx_t>& nv_for, std::vector<idx_t>& nv_from, s
         ne_for[owner] += xadj[i + 1] - xadj[i];
     }
 
-    for(int i=0;i<comm_size;i++)
-    {
-        //brakuje scattera we wraperze
-        MPI_Scatter(nv_for.data(), 1, MPI_INT, &nv_from[i], 1, MPI_INT, i, comm.get());
-        MPI_Scatter(ne_for.data(), 1, MPI_INT, &ne_from[i], 1, MPI_INT, i, comm.get());
-    }
+    MPI_Alltoall(nv_for.data(), 1, MPI_INT, nv_from.data(), 1, MPI_INT, comm.get());
+    MPI_Alltoall(ne_for.data(), 1, MPI_INT, ne_from.data(), 1, MPI_INT, comm.get());
 }
 
 void redistributeGraphData(std::vector<std::vector<idx_t>>& svi, std::vector<std::vector<idx_t>>& svci, std::vector<std::vector<idx_t>>& sne,
@@ -329,9 +325,9 @@ void renumberVertsAndFreeOldData(std::vector<idx_t>& local_current_ids, std::vec
     }
 
     std::vector<std::vector<idx_t>> recv_ids_from(comm_size);
+    MPI_Alltoall(n_unknown_ids_for.data(), 1, MPI_INT, n_unknown_ids_from.data(), 1, MPI_INT, comm.get());
     for(int i=0;i<comm_size;i++)
     {
-        MPI_Scatter(n_unknown_ids_for.data(), 1, MPI_INT, &n_unknown_ids_from[i], 1, MPI_INT, i, comm.get());
         recv_ids_from[i].resize(n_unknown_ids_from[i]);
     }
     
@@ -402,9 +398,9 @@ void renumberVertsAndFreeOldData(std::vector<idx_t>& local_current_ids, std::vec
         new_ids[i].resize(unknown_ids_final[i].size());
         n_unknown_ids_for[i] = unknown_ids_final[i].size();
     }
+    MPI_Alltoall(n_unknown_ids_for.data(), 1, MPI_INT, n_unknown_ids_from.data(), 1, MPI_INT, comm.get());
     for(int i=0;i<comm_size;i++)
     {
-        MPI_Scatter(n_unknown_ids_for.data(), 1, MPI_INT, &n_unknown_ids_from[i], 1, MPI_INT, i, comm.get());
         recv_ids_from[i].resize(n_unknown_ids_from[i]);
     }
 
